@@ -1,3 +1,4 @@
+# Download engine (CLI + GUI)
 selenium>=4.32.0
 urllib3<3,>=1.26
 trio~=0.17
@@ -5,3 +6,7 @@ trio-websocket~=0.9
 typing_extensions~=4.9
 websocket-client~=1.8
 pypdf>=6.0
+
+# Desktop GUI (gui_app.py) — not needed for CLI-only use
+customtkinter>=5.2.2
+Pillow>=10.0

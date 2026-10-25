@@ -36,6 +36,7 @@
 
 ## Features
 
+- **Windows desktop app** - Clean GUI with live progress, cancellation, recent downloads, and dark/light themes (see below)
 - **One-click download** - Just paste the Scribd URL and get your PDF
 - **Supports both Scribd URL styles** - Works with `/document/...` and legacy `/doc/...` links
 - **Runs in background** - Headless Chrome, no browser window pops up
@@ -72,6 +73,39 @@
    ```bash
    pip install -r requirements.txt
    ```
+
+---
+
+## Windows App (GUI)
+
+A clean, single-window desktop app built on the same engine — paste a link, watch page-by-page progress with an ETA, cancel anytime, then open the PDF right from the app.
+
+**Run from source:**
+
+```powershell
+pip install -r requirements.txt
+python gui_app.py
+```
+
+…or double-click **`run_gui.bat`** (launches without a console window).
+
+**Build a standalone `.exe`** (single file, no Python needed on the target PC):
+
+```powershell
+build_windows.bat
+```
+
+This installs dependencies, regenerates the icon (`assets/make_icon.py`), runs PyInstaller with `ScribdDownloader.spec`, and self-checks the result at `dist\ScribdDownloader.exe`. Google Chrome still needs to be installed on the target PC (the app shows a “Chrome ready / not found” status in the header).
+
+What you get:
+
+- **Smart paste** — a Scribd link already on your clipboard is detected automatically; links are validated as you type with the document title/ID previewed
+- **Save-as controls** — editable file name (auto-filled, Windows-safe), folder picker, full-path preview, and an Overwrite / Save-as-copy prompt
+- **Live progress** — Connect → Load → Export → Merge step indicator, per-page progress bar, elapsed/ETA, and a collapsible activity log you can copy when reporting issues
+- **Cancel safely** — stops between pages and discards incomplete output
+- **Recent downloads** — reopen or reveal the last 5 PDFs in one click
+- **Settings dialog** — appearance (System/Light/Dark), pages-per-batch, timeouts, show-browser troubleshooting mode, open-when-done; saved to `%APPDATA%\ScribdDownloader\settings.json`
+- **Diagnostics** — `python gui_app.py --check` (or `ScribdDownloader.exe --check`) verifies the engine, dependencies, and Chrome detection without opening a window
 
 ---
 
@@ -175,6 +209,12 @@ The batch size was `8` in both tests. Long documents still take time because Chr
 ---
 
 ## Troubleshooting
+
+### GUI: Windows SmartScreen warning on first run
+An unsigned, locally built `.exe` may trigger SmartScreen. Choose **More info → Run anyway** (you built it from this source), or run from source with `run_gui.bat`.
+
+### GUI: “Chrome not found” in the header
+Install [Google Chrome](https://www.google.com/chrome/), then restart the app. To reset all GUI settings, delete `%APPDATA%\ScribdDownloader\settings.json`.
 
 ### "ChromeDriver not found" error
 The script uses Selenium Manager to auto-download ChromeDriver. If you face issues:
