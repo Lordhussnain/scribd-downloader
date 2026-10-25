@@ -3,18 +3,25 @@ Scribd Downloader — Windows desktop GUI
 =======================================
 
 A clean, single-window interface on top of the CLI engine in
-``scribd-downloader.py``. All downloading (headless Chrome, per-page PDF
-export, disk-spooled merge) is done by the engine's ``download_document()``;
-this file only handles presentation, settings and threading.
+``scribd-downloader.py``, with a multi-document download queue and
+drag-&-drop. All downloading (headless Chrome, per-page PDF export,
+disk-spooled merge) is done by the engine's ``download_document()``;
+this file only handles presentation, the queue, settings and threading.
+
+Documents are downloaded **one at a time** from the queue. The engine keeps
+browser memory bounded per document, so running several Chrome exports in
+parallel would defeat that; a sequential queue of unlimited length is the
+reliable way to fetch many documents at once.
 
 Run from source (Windows, Python 3.10+ with Tk from python.org):
 
     pip install -r requirements.txt
     python gui_app.py
 
-Build a standalone ``ScribdDownloader.exe``:
+Build a standalone ``ScribdDownloader.exe`` / installer:
 
-    build_windows.bat          (or: pyinstaller ScribdDownloader.spec)
+    build_windows.bat          (portable .exe)
+    build_installer.bat        (Inno Setup installer, needs Inno Setup 6)
 
 Diagnostics without opening the window:
 
@@ -48,9 +55,23 @@ try:
 except ImportError:
     ctk = None
 
+# Drag-&-drop is an enhancement, never a requirement: if tkinterdnd2 (or its
+# native tkdnd library) is unavailable, the app runs identically without it.
+try:
+    from tkinterdnd2 import COPY as _DND_COPY
+    from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
+
+    _DND_AVAILABLE = True
+except Exception:  # ImportError or a broken native build
+    TkinterDnD = None
+    DND_FILES = DND_TEXT = _DND_COPY = None
+    _DND_AVAILABLE = False
+
 APP_NAME = "Scribd Downloader"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 CHROME_DOWNLOAD_URL = "https://www.google.com/chrome/"
+LINK_FILE_EXTENSIONS = {".txt", ".text", ".md", ".csv", ".url", ".html", ".htm"}
+MAX_LINK_FILE_BYTES = 2 * 1024 * 1024
 
 # --- Palette: (light, dark). Teal accent in keeping with Scribd's brand. ---
 ACCENT = ("#0C7A78", "#14908C")
@@ -60,11 +81,18 @@ CARD_BG = ("#FFFFFF", "#1C1F24")
 CARD_BORDER = ("#E3E6EA", "#272C33")
 FIELD_BG = ("#F7F8FA", "#14171B")
 FIELD_BORDER = ("#D5DAE0", "#2E343C")
+TEXT_MAIN = ("#1A1D21", "#E8EAED")
 TEXT_MUTED = ("#5F6873", "#9AA3AE")
 SUCCESS = ("#178A4C", "#2FBF71")
 ERROR = ("#C0392B", "#E66A5E")
 WARNING = ("#B7791F", "#E3B341")
 FONT_FAMILY = "Segoe UI"  # native on Windows; harmless fallback elsewhere
+
+CONFLICT_POLICIES = {  # user-facing label -> internal value
+    "Save as copy": "copy",
+    "Skip existing": "skip",
+    "Overwrite": "overwrite",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +152,9 @@ class AppSettings:
     show_browser: bool = False
     open_when_done: bool = False
     clipboard_check: bool = True
+    conflict_policy: str = "copy"  # copy | skip | overwrite (existing files)
     recents: list = field(default_factory=list)  # [{path, title, ts}]
+    pending_queue: list = field(default_factory=list)  # [{source_url, filename}]
 
     @classmethod
     def load(cls):
@@ -154,6 +184,112 @@ class AppSettings:
         )
         self.recents = self.recents[:5]
         self.save()
+
+
+# ---------------------------------------------------------------------------
+# Queue model + drop/paste parsing (pure logic — unit-tested, no Tk needed)
+# ---------------------------------------------------------------------------
+@dataclass
+class QueueItem:
+    """One queued document. Widget updates are derived from ``status``."""
+
+    source_url: str
+    document_id: str
+    title: str
+    filename: str  # e.g. "My-Document.pdf" (editable stem, extension kept)
+    status: str = "pending"  # pending|downloading|done|failed|cancelled|skipped
+    output_path: object = None  # Path once known
+    percent: int = 0
+    detail: str = ""  # friendly error / note shown under the title
+
+    @classmethod
+    def from_info(cls, info):
+        return cls(
+            source_url=info["source_url"],
+            document_id=info["document_id"],
+            title=info["title"] or f"Scribd document {info['document_id']}",
+            filename=info["filename"],
+        )
+
+
+def dedupe_infos(infos, known_ids=None):
+    """Drop duplicate document ids, keeping first-seen order."""
+    seen = set(known_ids or ())
+    unique = []
+    for info in infos:
+        if info["document_id"] in seen:
+            continue
+        seen.add(info["document_id"])
+        unique.append(info)
+    return unique
+
+
+def split_drop_files(data):
+    """Split a tkdnd file-list string into paths.
+
+    Paths containing spaces are brace-quoted by tkdnd, e.g.
+    ``{C:/My Docs/links.txt} C:/plain.txt``. This is a small brace-aware
+    splitter used as a fallback when Tk's own ``splitlist`` is unavailable
+    (and in unit tests).
+    """
+    parts, current, depth = [], [], 0
+    for char in str(data or ""):
+        if char == "{":
+            depth += 1
+            if depth > 1:
+                current.append(char)
+        elif char == "}":
+            depth = max(0, depth - 1)
+            if depth > 0:
+                current.append(char)
+        elif char.isspace() and depth == 0:
+            if current:
+                parts.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if current:
+        parts.append("".join(current))
+    return [part.strip() for part in parts if part.strip()]
+
+
+def read_urls_from_files(engine, paths):
+    """Extract Scribd links from dropped/imported link files (.txt/.url/…)."""
+    infos = []
+    for raw_path in paths:
+        path = Path(str(raw_path).strip().strip("{}"))
+        try:
+            if not path.is_file() or path.suffix.lower() not in LINK_FILE_EXTENSIONS:
+                continue
+            if path.stat().st_size > MAX_LINK_FILE_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        infos.extend(engine.extract_scribd_urls(text))
+    return dedupe_infos(infos)
+
+
+def parse_drop_data(engine, data, splitlist=None):
+    """Turn raw drag-&-drop data into deduplicated Scribd link infos.
+
+    Handles links dragged from a browser (plain text, sometimes with the
+    page title attached), files dragged from Explorer (``splitlist`` is
+    Tk's own splitter when available), and mixtures of both.
+    """
+    data = str(data or "")
+    infos = list(engine.extract_scribd_urls(data))
+    if splitlist is not None:
+        try:
+            parts = [str(part) for part in splitlist(data)]
+        except Exception:
+            parts = split_drop_files(data)
+    else:
+        parts = split_drop_files(data)
+    files = [part for part in parts if Path(part).is_file()]
+    if files:
+        infos.extend(read_urls_from_files(engine, files))
+    return dedupe_infos(infos)
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +383,7 @@ def friendly_error(error):
     """Map raw Selenium/engine errors to a short, helpful sentence."""
     text = str(error)
     low = text.lower()
-    if "no printable document pages" in text:
+    if "no printable document pages" in low:
         return (
             "No pages could be read from this document. It may be private, "
             "removed, or protected."
@@ -276,6 +412,7 @@ def run_check():
     print(f"Python      : {sys.version.split()[0]} ({sys.platform})")
     print(f"Frozen (.exe): {bool(getattr(sys, 'frozen', False))}")
     print(f"CustomTkinter: {'OK' if ctk else 'MISSING - pip install customtkinter'}")
+    print(f"Drag & drop  : {'OK (tkinterdnd2)' if _DND_AVAILABLE else 'unavailable (app works without it)'}")
     print(f"Selenium     : {'OK' if selenium else 'MISSING - pip install selenium'}")
     print(f"pypdf        : {'OK' if pypdf else 'MISSING - pip install pypdf'}")
     try:
@@ -283,7 +420,12 @@ def run_check():
         sample = engine.parse_scribd_url(
             "https://www.scribd.com/document/123456789/Sample-Title"
         )
-        print(f"Engine       : OK ({sample['filename']} <- id {sample['document_id']})")
+        found = engine.extract_scribd_urls(
+            "a https://www.scribd.com/document/1/One "
+            "b https://www.scribd.com/doc/2/Two"
+        )
+        print(f"Engine       : OK ({sample['filename']} <- id {sample['document_id']}; "
+              f"multi-link extract found {len(found)})")
     except Exception as error:  # noqa: BLE001 - diagnostic output
         print(f"Engine       : FAILED - {error}")
         return 1
@@ -307,49 +449,76 @@ if ctk is not None:
         "export": "Export PDF",
         "merge": "Merge",
     }
+    STATUS_COLORS = {
+        "pending": TEXT_MUTED,
+        "downloading": ACCENT,
+        "done": SUCCESS,
+        "failed": ERROR,
+        "cancelled": WARNING,
+        "skipped": WARNING,
+    }
+    FINISHED_STATUSES = ("done", "failed", "cancelled", "skipped")
 
-    class ScribdDownloaderApp(ctk.CTk):
+    # Root class with optional drag-&-drop support mixed in.
+    if _DND_AVAILABLE:
+        class _AppBase(ctk.CTk, TkinterDnD.DnDWrapper):
+            pass
+    else:
+        _AppBase = ctk.CTk
+
+    class ScribdDownloaderApp(_AppBase):
         def __init__(self, engine, settings):
             super().__init__()
             self.engine = engine
             self.settings = settings
 
             self.title(APP_NAME)
-            self.geometry("920x760")
-            self.minsize(800, 660)
+            self.geometry("940x860")
+            self.minsize(820, 720)
             self.configure(fg_color=WINDOW_BG)
             self._set_window_icon()
             self._center_on_screen()
 
             # State
             self.events = queue.Queue()
-            self.cancel_event = threading.Event()
+            self.items = []  # list[QueueItem]; widgets rebuilt from this
+            self.row_refs = {}  # document_id -> {"dot","sub","pct"} labels
+            self.queue_stop = threading.Event()
+            self.current_cancel = None  # threading.Event of the running item
             self.worker = None
-            self.state = "idle"  # idle | downloading | cancelling | success | error | cancelled
-            self.parsed = None
-            self.filename_dirty = False
-            self._dirty_doc_id = None
-            self._setting_filename = False
+            self.running = False
+            self.current_item = None
+            self.run_stats = {"done": 0, "failed": 0, "skipped": 0, "cancelled": 0}
+            self.last_saved_path = None
+            self.parsed = None  # parse of the URL entry (single-link preview)
             self.started_at = None
             self.export_started_at = None
             self.last_progress = {}
-            self.output_path = None
-            self.output_existed_before = False
             self._last_clipboard = None
             self._validate_job = None
             self.log_visible = False
+            self.dnd_enabled = False
 
             # Tk variables
             self.url_var = tk.StringVar()
-            self.filename_var = tk.StringVar()
             self.folder_var = tk.StringVar(value=settings.output_dir)
+            self.policy_var = tk.StringVar(
+                value=next(
+                    (label for label, v in CONFLICT_POLICIES.items()
+                     if v == settings.conflict_policy),
+                    "Save as copy",
+                )
+            )
 
             self._build_ui()
             self._bind_events()
+            self._init_dnd()
+            self._restore_pending_queue()
             self._refresh_chrome_status()
             self._refresh_recents()
             self._validate_url()
-            self._update_path_preview()
+            self._refresh_queue()
+            self._refresh_actions()
 
             self.after(80, self._poll_events)
             self.after(600, self._check_clipboard)
@@ -358,10 +527,11 @@ if ctk is not None:
 
         # ---------------------------------------------------------- setup
         def _set_window_icon(self):
-            assets = Path(__file__).resolve().parent / "assets"
+            roots = []
             meipass = getattr(sys, "_MEIPASS", None)
-            roots = [Path(meipass) / "assets"] if meipass else []
-            roots.append(assets)
+            if meipass:
+                roots.append(Path(meipass) / "assets")
+            roots.append(Path(__file__).resolve().parent / "assets")
             for root in roots:
                 ico = root / "icon.ico"
                 if sys.platform.startswith("win") and ico.is_file():
@@ -381,8 +551,8 @@ if ctk is not None:
 
         def _center_on_screen(self):
             self.update_idletasks()
-            width = self.winfo_width() if self.winfo_width() > 1 else 920
-            height = self.winfo_height() if self.winfo_height() > 1 else 760
+            width = self.winfo_width() if self.winfo_width() > 1 else 940
+            height = self.winfo_height() if self.winfo_height() > 1 else 860
             x = max(0, (self.winfo_screenwidth() - width) // 2)
             y = max(0, (self.winfo_screenheight() - height) // 2)
             self.geometry(f"+{x}+{y}")
@@ -394,9 +564,11 @@ if ctk is not None:
         def _build_ui(self):
             outer = ctk.CTkFrame(self, fg_color="transparent")
             outer.pack(fill="both", expand=True, padx=28, pady=(20, 14))
+            self.outer = outer
 
             self._build_header(outer)
             self._build_url_card(outer)
+            self._build_queue_card(outer)
             self._build_save_card(outer)
             self._build_actions(outer)
             self._build_progress_card(outer)
@@ -405,38 +577,47 @@ if ctk is not None:
 
             footer = ctk.CTkLabel(
                 outer,
-                text="Runs locally in headless Chrome  ·  Only download documents you have the right to access.",
+                text="Runs locally in headless Chrome  ·  Queue downloads one document at a time  ·  Only download documents you have the right to access.",
                 font=self._font(11),
                 text_color=TEXT_MUTED,
             )
             footer.pack(side="bottom", pady=(10, 0))
 
+            # Drop overlay (shown while dragging over the window)
+            self.drop_overlay = ctk.CTkFrame(
+                self, fg_color=CARD_BG, border_color=ACCENT,
+                border_width=3, corner_radius=16,
+            )
+            ctk.CTkLabel(
+                self.drop_overlay,
+                text="Drop Scribd links or .txt files\nto add them to the queue",
+                font=self._font(20, "bold"), text_color=ACCENT,
+            ).place(relx=0.5, rely=0.5, anchor="center")
+
         def _card(self, parent):
             card = ctk.CTkFrame(
-                parent,
-                fg_color=CARD_BG,
-                border_color=CARD_BORDER,
-                border_width=1,
-                corner_radius=14,
+                parent, fg_color=CARD_BG, border_color=CARD_BORDER,
+                border_width=1, corner_radius=14,
             )
             card.pack(fill="x", pady=(0, 14))
             return card
+
+        def _ghost_button(self, parent, text, width, command, height=38):
+            return ctk.CTkButton(
+                parent, text=text, width=width, height=height,
+                font=self._font(12), fg_color="transparent",
+                hover_color=FIELD_BG, border_color=FIELD_BORDER, border_width=1,
+                text_color=TEXT_MAIN, command=command,
+            )
 
         def _build_header(self, parent):
             header = ctk.CTkFrame(parent, fg_color="transparent")
             header.pack(fill="x", pady=(0, 16))
 
-            logo = ctk.CTkLabel(
-                header,
-                text="S",
-                width=46,
-                height=46,
-                corner_radius=12,
-                fg_color=ACCENT,
-                text_color="white",
-                font=self._font(24, "bold"),
-            )
-            logo.pack(side="left")
+            ctk.CTkLabel(
+                header, text="S", width=46, height=46, corner_radius=12,
+                fg_color=ACCENT, text_color="white", font=self._font(24, "bold"),
+            ).pack(side="left")
 
             titles = ctk.CTkFrame(header, fg_color="transparent")
             titles.pack(side="left", padx=(12, 0))
@@ -444,11 +625,8 @@ if ctk is not None:
                 titles, text=APP_NAME, font=self._font(21, "bold"), anchor="w"
             ).pack(fill="x")
             ctk.CTkLabel(
-                titles,
-                text="Download Scribd documents as clean PDFs",
-                font=self._font(12),
-                text_color=TEXT_MUTED,
-                anchor="w",
+                titles, text="Download Scribd documents as clean PDFs",
+                font=self._font(12), text_color=TEXT_MUTED, anchor="w",
             ).pack(fill="x")
             self.chrome_label = ctk.CTkLabel(
                 titles, text="", font=self._font(11), anchor="w", cursor="hand2"
@@ -460,32 +638,16 @@ if ctk is not None:
             )
 
             appearance = ctk.CTkOptionMenu(
-                header,
-                values=["System", "Light", "Dark"],
-                width=104,
-                height=32,
-                font=self._font(12),
-                fg_color=CARD_BG,
-                button_color=FIELD_BORDER,
-                button_hover_color=ACCENT,
-                text_color=("#1A1D21", "#E8EAED"),
+                header, values=["System", "Light", "Dark"], width=104, height=32,
+                font=self._font(12), fg_color=CARD_BG, button_color=FIELD_BORDER,
+                button_hover_color=ACCENT, text_color=TEXT_MAIN,
                 command=self._on_appearance_change,
             )
             appearance.set(self.settings.appearance)
             appearance.pack(side="right")
-            ctk.CTkButton(
-                header,
-                text="Settings",
-                width=92,
-                height=32,
-                font=self._font(12),
-                fg_color=CARD_BG,
-                hover_color=FIELD_BG,
-                border_color=CARD_BORDER,
-                border_width=1,
-                text_color=("#1A1D21", "#E8EAED"),
-                command=self._open_settings,
-            ).pack(side="right", padx=(0, 8))
+            self._ghost_button(header, "Settings", 92, self._open_settings, height=32).pack(
+                side="right", padx=(0, 8)
+            )
 
         def _build_url_card(self, parent):
             card = self._card(parent)
@@ -493,48 +655,41 @@ if ctk is not None:
             inner.pack(fill="x", padx=18, pady=16)
 
             ctk.CTkLabel(
-                inner, text="Scribd document URL", font=self._font(13, "bold"), anchor="w"
+                inner, text="Add Scribd documents", font=self._font(13, "bold"),
+                anchor="w",
             ).pack(fill="x", pady=(0, 8))
 
             row = ctk.CTkFrame(inner, fg_color="transparent")
             row.pack(fill="x")
             self.url_entry = ctk.CTkEntry(
-                row,
-                textvariable=self.url_var,
-                placeholder_text="https://www.scribd.com/document/123456789/Document-Title",
-                height=42,
-                font=self._font(13),
-                fg_color=FIELD_BG,
-                border_color=FIELD_BORDER,
-                border_width=1,
-                corner_radius=10,
+                row, textvariable=self.url_var,
+                placeholder_text="Paste one or more Scribd links…",
+                height=42, font=self._font(13), fg_color=FIELD_BG,
+                border_color=FIELD_BORDER, border_width=1, corner_radius=10,
             )
             self.url_entry.pack(side="left", fill="x", expand=True)
-            self.paste_btn = ctk.CTkButton(
-                row, text="Paste", width=78, height=42, font=self._font(12),
-                fg_color="transparent", hover_color=FIELD_BG,
-                border_color=FIELD_BORDER, border_width=1,
-                text_color=("#1A1D21", "#E8EAED"), command=self._paste_from_clipboard,
+            self.paste_btn = self._ghost_button(
+                row, "Paste", 78, self._paste_from_clipboard, height=42
             )
             self.paste_btn.pack(side="left", padx=(8, 0))
-            self.clear_btn = ctk.CTkButton(
-                row, text="Clear", width=64, height=42, font=self._font(12),
-                fg_color="transparent", hover_color=FIELD_BG,
-                border_color=FIELD_BORDER, border_width=1,
-                text_color=("#1A1D21", "#E8EAED"), command=self._clear_url,
+            self.add_btn = ctk.CTkButton(
+                row, text="Add to queue", width=118, height=42,
+                font=self._font(12, "bold"), fg_color=ACCENT,
+                hover_color=ACCENT_HOVER, text_color="white",
+                command=self._add_from_entry,
             )
-            self.clear_btn.pack(side="left", padx=(8, 0))
+            self.add_btn.pack(side="left", padx=(8, 0))
 
             self.url_hint = ctk.CTkLabel(
                 inner, text="", font=self._font(12), text_color=TEXT_MUTED,
-                anchor="w", wraplength=820,
+                anchor="w", wraplength=840,
             )
             self.url_hint.pack(fill="x", pady=(8, 0))
 
             self.doc_info = ctk.CTkFrame(inner, fg_color="transparent")
             self.doc_title = ctk.CTkLabel(
-                self.doc_info, text="", font=self._font(14, "bold"), anchor="w",
-                wraplength=820,
+                self.doc_info, text="", font=self._font(14, "bold"),
+                anchor="w", wraplength=840,
             )
             self.doc_title.pack(fill="x", pady=(6, 0))
             self.doc_meta = ctk.CTkLabel(
@@ -543,49 +698,77 @@ if ctk is not None:
             )
             self.doc_meta.pack(fill="x")
 
+        def _build_queue_card(self, parent):
+            card = self._card(parent)
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.pack(fill="x", padx=18, pady=(14, 10))
+
+            header = ctk.CTkFrame(inner, fg_color="transparent")
+            header.pack(fill="x", pady=(0, 8))
+            self.queue_title = ctk.CTkLabel(
+                header, text="Queue", font=self._font(13, "bold"), anchor="w"
+            )
+            self.queue_title.pack(side="left")
+            self.clear_done_btn = self._ghost_button(
+                header, "Clear finished", 116,
+                lambda: self._clear_items(FINISHED_STATUSES), height=30,
+            )
+            self.clear_done_btn.pack(side="right")
+            self.clear_all_btn = self._ghost_button(
+                header, "Clear all", 84,
+                lambda: self._clear_items(("pending",) + FINISHED_STATUSES),
+                height=30,
+            )
+            self.clear_all_btn.pack(side="right", padx=(0, 8))
+            self.import_btn = self._ghost_button(
+                header, "Add from file…", 122, self._import_link_files, height=30
+            )
+            self.import_btn.pack(side="right", padx=(0, 8))
+
+            self.queue_list = ctk.CTkScrollableFrame(
+                inner, height=176, fg_color="transparent",
+                scrollbar_button_color=FIELD_BORDER,
+            )
+            self.queue_list.pack(fill="x")
+
         def _build_save_card(self, parent):
             card = self._card(parent)
             inner = ctk.CTkFrame(card, fg_color="transparent")
-            inner.pack(fill="x", padx=18, pady=16)
+            inner.pack(fill="x", padx=18, pady=14)
 
+            row = ctk.CTkFrame(inner, fg_color="transparent")
+            row.pack(fill="x")
             ctk.CTkLabel(
-                inner, text="Save as", font=self._font(13, "bold"), anchor="w"
-            ).pack(fill="x", pady=(0, 8))
-
-            name_row = ctk.CTkFrame(inner, fg_color="transparent")
-            name_row.pack(fill="x")
-            self.filename_entry = ctk.CTkEntry(
-                name_row, textvariable=self.filename_var,
-                placeholder_text="File name", height=38, font=self._font(13),
-                fg_color=FIELD_BG, border_color=FIELD_BORDER, border_width=1,
-                corner_radius=10,
-            )
-            self.filename_entry.pack(side="left", fill="x", expand=True)
-            ctk.CTkLabel(
-                name_row, text=".pdf", font=self._font(13), text_color=TEXT_MUTED
-            ).pack(side="left", padx=(6, 0))
-
-            folder_row = ctk.CTkFrame(inner, fg_color="transparent")
-            folder_row.pack(fill="x", pady=(10, 0))
+                row, text="Save PDFs to", font=self._font(13, "bold")
+            ).pack(side="left", padx=(0, 10))
             self.folder_entry = ctk.CTkEntry(
-                folder_row, textvariable=self.folder_var, height=38,
+                row, textvariable=self.folder_var, height=38,
                 font=self._font(12), fg_color=FIELD_BG,
                 border_color=FIELD_BORDER, border_width=1, corner_radius=10,
             )
             self.folder_entry.pack(side="left", fill="x", expand=True)
-            self.browse_btn = ctk.CTkButton(
-                folder_row, text="Browse…", width=92, height=38,
-                font=self._font(12), fg_color="transparent",
-                hover_color=FIELD_BG, border_color=FIELD_BORDER, border_width=1,
-                text_color=("#1A1D21", "#E8EAED"), command=self._browse_folder,
-            )
+            self.browse_btn = self._ghost_button(row, "Browse…", 92, self._browse_folder)
             self.browse_btn.pack(side="left", padx=(8, 0))
 
-            self.path_preview = ctk.CTkLabel(
-                inner, text="", font=self._font(11), text_color=TEXT_MUTED,
-                anchor="w", wraplength=820,
+            policy_row = ctk.CTkFrame(inner, fg_color="transparent")
+            policy_row.pack(fill="x", pady=(10, 0))
+            ctk.CTkLabel(
+                policy_row, text="If a file already exists:",
+                font=self._font(12), text_color=TEXT_MUTED,
+            ).pack(side="left", padx=(0, 8))
+            policy = ctk.CTkOptionMenu(
+                policy_row, variable=self.policy_var,
+                values=list(CONFLICT_POLICIES.keys()), width=150, height=30,
+                font=self._font(12), fg_color=FIELD_BG,
+                button_color=FIELD_BORDER, button_hover_color=ACCENT,
+                text_color=TEXT_MAIN, command=self._on_policy_change,
             )
-            self.path_preview.pack(fill="x", pady=(8, 0))
+            policy.pack(side="left")
+            ctk.CTkLabel(
+                policy_row,
+                text="Tip: rename any queued PDF with its Edit button.",
+                font=self._font(11), text_color=TEXT_MUTED,
+            ).pack(side="left", padx=(12, 0))
 
         def _build_actions(self, parent):
             self.action_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -595,18 +778,25 @@ if ctk is not None:
                 self.action_frame, text="Download PDF", height=48,
                 font=self._font(15, "bold"), fg_color=ACCENT,
                 hover_color=ACCENT_HOVER, text_color="white",
-                corner_radius=12, command=self._start_download,
+                corner_radius=12, command=self._start_queue,
             )
             self.download_btn.pack(fill="x")
 
-            self.cancel_btn = ctk.CTkButton(
-                self.action_frame, text="Cancel download", height=48,
+            self.running_row = ctk.CTkFrame(self.action_frame, fg_color="transparent")
+            self.skip_btn = self._ghost_button(
+                self.running_row, "Skip current document", 200,
+                self._skip_current, height=48,
+            )
+            self.skip_btn.pack(side="left", fill="x", expand=True)
+            self.stop_btn = ctk.CTkButton(
+                self.running_row, text="Stop queue", width=200, height=48,
                 font=self._font(14, "bold"), fg_color="transparent",
                 hover_color=FIELD_BG, border_color=ERROR, border_width=1,
-                text_color=ERROR, corner_radius=12, command=self._cancel_download,
+                text_color=ERROR, corner_radius=12, command=self._stop_queue,
             )
+            self.stop_btn.pack(side="left", fill="x", expand=True, padx=(10, 0))
 
-            # Success / error panels (shown after a run finishes)
+            # End-of-run summary (per-document actions live in the queue rows)
             self.result_panel = ctk.CTkFrame(
                 parent, fg_color=CARD_BG, border_color=CARD_BORDER,
                 border_width=1, corner_radius=14,
@@ -615,44 +805,32 @@ if ctk is not None:
             result_inner.pack(fill="x", padx=18, pady=14)
             self.result_title = ctk.CTkLabel(
                 result_inner, text="", font=self._font(14, "bold"),
-                anchor="w", wraplength=820,
+                anchor="w", wraplength=840,
             )
             self.result_title.pack(fill="x")
             self.result_detail = ctk.CTkLabel(
                 result_inner, text="", font=self._font(12),
-                text_color=TEXT_MUTED, anchor="w", wraplength=820,
+                text_color=TEXT_MUTED, anchor="w", wraplength=840,
             )
             self.result_detail.pack(fill="x", pady=(2, 10))
             btn_row = ctk.CTkFrame(result_inner, fg_color="transparent")
             btn_row.pack(fill="x")
-            self.open_pdf_btn = ctk.CTkButton(
-                btn_row, text="Open PDF", width=120, height=36,
+            self.open_last_btn = ctk.CTkButton(
+                btn_row, text="Open latest PDF", width=140, height=36,
                 font=self._font(12, "bold"), fg_color=ACCENT,
                 hover_color=ACCENT_HOVER, text_color="white",
-                command=lambda: self.output_path and open_file(self.output_path),
+                command=lambda: self.last_saved_path and open_file(self.last_saved_path),
             )
-            self.open_pdf_btn.pack(side="left")
-            self.open_folder_btn = ctk.CTkButton(
-                btn_row, text="Open folder", width=120, height=36,
-                font=self._font(12), fg_color="transparent",
-                hover_color=FIELD_BG, border_color=FIELD_BORDER, border_width=1,
-                text_color=("#1A1D21", "#E8EAED"),
-                command=lambda: self.output_path and open_folder(self.output_path),
-            )
-            self.open_folder_btn.pack(side="left", padx=(8, 0))
-            self.retry_btn = ctk.CTkButton(
-                btn_row, text="Try again", width=120, height=36,
-                font=self._font(12, "bold"), fg_color=ACCENT,
-                hover_color=ACCENT_HOVER, text_color="white",
-                command=self._start_download,
-            )
-            self.new_download_btn = ctk.CTkButton(
-                btn_row, text="New download", width=130, height=36,
-                font=self._font(12), fg_color="transparent",
-                hover_color=FIELD_BG, border_color=FIELD_BORDER, border_width=1,
-                text_color=("#1A1D21", "#E8EAED"), command=self._reset_form,
-            )
-            self.new_download_btn.pack(side="left", padx=(8, 0))
+            self.open_last_btn.pack(side="left")
+            self._ghost_button(
+                btn_row, "Open folder", 120,
+                lambda: open_folder(self.folder_var.get() or default_downloads_dir()),
+                height=36,
+            ).pack(side="left", padx=(8, 0))
+            self._ghost_button(
+                btn_row, "Clear finished", 130,
+                lambda: self._clear_items(FINISHED_STATUSES), height=36,
+            ).pack(side="left", padx=(8, 0))
 
         def _build_progress_card(self, parent):
             self.progress_card = ctk.CTkFrame(
@@ -661,6 +839,12 @@ if ctk is not None:
             )
             inner = ctk.CTkFrame(self.progress_card, fg_color="transparent")
             inner.pack(fill="x", padx=18, pady=16)
+
+            self.overall_label = ctk.CTkLabel(
+                inner, text="", font=self._font(12, "bold"),
+                text_color=TEXT_MUTED, anchor="w", wraplength=840,
+            )
+            self.overall_label.pack(fill="x", pady=(0, 10))
 
             steps_row = ctk.CTkFrame(inner, fg_color="transparent")
             steps_row.pack(fill="x", pady=(0, 12))
@@ -723,9 +907,8 @@ if ctk is not None:
                 hover_color=FIELD_BG, text_color=TEXT_MUTED,
                 command=self._clear_log,
             )
-
             self.log_box = ctk.CTkTextbox(
-                parent, height=120, font=ctk.CTkFont(family="Consolas", size=11),
+                parent, height=110, font=ctk.CTkFont(family="Consolas", size=11),
                 fg_color=CARD_BG, border_color=CARD_BORDER, border_width=1,
                 corner_radius=10, state="disabled",
             )
@@ -737,11 +920,10 @@ if ctk is not None:
         # ---------------------------------------------------------- events
         def _bind_events(self):
             self.url_var.trace_add("write", lambda *_: self._schedule_validate())
-            self.filename_var.trace_add("write", lambda *_: self._on_filename_change())
-            self.folder_var.trace_add("write", lambda *_: self._update_path_preview())
-            self.url_entry.bind("<Return>", lambda _e: self._start_download())
-            self.filename_entry.bind("<Return>", lambda _e: self._start_download())
-            self.bind("<Escape>", lambda _e: self._cancel_download())
+            self.url_entry.bind("<Return>", lambda _e: self._add_from_entry())
+            self.url_entry.bind("<<Paste>>", self._on_entry_paste)
+            self.bind("<Control-Return>", lambda _e: self._start_queue())
+            self.bind("<Escape>", lambda _e: self.running and self._stop_queue())
             self.bind("<FocusIn>", lambda _e: self.after(150, self._check_clipboard))
 
         def _schedule_validate(self):
@@ -749,18 +931,55 @@ if ctk is not None:
                 self.after_cancel(self._validate_job)
             self._validate_job = self.after(220, self._validate_url)
 
-        def _on_filename_change(self):
-            if not self._setting_filename:
-                self.filename_dirty = True
-                self._dirty_doc_id = (self.parsed or {}).get("document_id")
-            self._update_path_preview()
+        # ---------------------------------------------------------- drag & drop
+        def _init_dnd(self):
+            if not _DND_AVAILABLE:
+                return
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+                for target in (self, self.drop_overlay, self.queue_list):
+                    target.drop_target_register(DND_FILES, DND_TEXT)
+                    target.dnd_bind("<<Drop>>", self._on_drop)
+                    target.dnd_bind(
+                        "<<DropEnter>>", lambda _e: self._show_drop_overlay(True)
+                    )
+                    target.dnd_bind(
+                        "<<DropLeave>>", lambda _e: self._show_drop_overlay(False)
+                    )
+                self.dnd_enabled = True
+            except Exception:
+                self.dnd_enabled = False  # app is fully usable without DnD
+
+        def _show_drop_overlay(self, show):
+            if show:
+                self.drop_overlay.place(
+                    relx=0.5, rely=0.5, anchor="center", relwidth=0.94, relheight=0.94
+                )
+                self.drop_overlay.lift()
+            else:
+                self.drop_overlay.place_forget()
+
+        def _on_drop(self, event):
+            self._show_drop_overlay(False)
+            try:
+                splitlist = self.tk.splitlist
+            except Exception:
+                splitlist = None
+            infos = parse_drop_data(self.engine, getattr(event, "data", ""), splitlist)
+            if infos:
+                self._add_infos(infos, source="dropped")
+            else:
+                self.url_hint.configure(
+                    text="No Scribd links found in what you dropped. "
+                         "Drop document links or a .txt file of links.",
+                    text_color=WARNING,
+                )
+            return _DND_COPY
 
         # ---------------------------------------------------------- header
         def _refresh_chrome_status(self):
             if find_chrome():
-                self.chrome_label.configure(
-                    text="●  Chrome ready", text_color=SUCCESS
-                )
+                self.chrome_label.configure(text="●  Chrome ready", text_color=SUCCESS)
             else:
                 self.chrome_label.configure(
                     text="●  Chrome not found — click to install Google Chrome",
@@ -772,66 +991,122 @@ if ctk is not None:
             self.settings.save()
             ctk.set_appearance_mode(value)
 
-        # ---------------------------------------------------------- URL UX
+        def _on_policy_change(self, label):
+            self.settings.conflict_policy = CONFLICT_POLICIES.get(label, "copy")
+            self.settings.save()
+
+        # ---------------------------------------------------------- adding links
         def _validate_url(self):
             self._validate_job = None
             raw = self.url_var.get().strip()
-            self.parsed = self.engine.parse_scribd_url(raw) if raw else None
+            infos = self.engine.extract_scribd_urls(raw) if raw else []
+            self.parsed = infos[0] if infos else None
 
             if not raw:
-                self.url_hint.configure(
-                    text="Paste a link like  scribd.com/document/123456789/Document-Title",
-                    text_color=TEXT_MUTED,
-                )
+                hint = "Paste links like  scribd.com/document/123456789/Document-Title"
+                if self.dnd_enabled:
+                    hint += "  ·  or drag & drop links / .txt files anywhere in this window"
+                self.url_hint.configure(text=hint, text_color=TEXT_MUTED)
                 self.url_entry.configure(border_color=FIELD_BORDER)
                 self.doc_info.pack_forget()
-            elif not self.parsed:
+            elif not infos:
                 self.url_hint.configure(
-                    text="That doesn't look like a Scribd document URL yet.",
+                    text="No Scribd document link found in that text yet.",
                     text_color=ERROR,
                 )
                 self.url_entry.configure(border_color=ERROR)
                 self.doc_info.pack_forget()
-            else:
-                self.url_hint.configure(text="✓  Valid Scribd link", text_color=SUCCESS)
+            elif len(infos) == 1:
+                self.url_hint.configure(
+                    text="✓  Valid Scribd link — Enter adds it to the queue",
+                    text_color=SUCCESS,
+                )
                 self.url_entry.configure(border_color=SUCCESS)
-                title = self.parsed["title"] or f"Scribd document {self.parsed['document_id']}"
+                title = infos[0]["title"] or f"Scribd document {infos[0]['document_id']}"
                 self.doc_title.configure(text=title)
                 self.doc_meta.configure(
-                    text=f"Document ID {self.parsed['document_id']}  ·  Exported as a clean, toolbar-free PDF"
+                    text=f"Document ID {infos[0]['document_id']}  ·  "
+                         "Exported as a clean, toolbar-free PDF"
                 )
                 self.doc_info.pack(fill="x")
-                if not self.filename_dirty or self._dirty_doc_id != self.parsed["document_id"]:
-                    self._setting_filename = True
-                    self.filename_var.set(Path(self.parsed["filename"]).stem)
-                    self._setting_filename = False
+            else:
+                self.url_hint.configure(
+                    text=f"✓  Found {len(infos)} Scribd links — Enter adds them all",
+                    text_color=SUCCESS,
+                )
+                self.url_entry.configure(border_color=SUCCESS)
+                self.doc_info.pack_forget()
+            self._refresh_actions()
 
-            self._refresh_download_button()
-            self._update_path_preview()
+        def _add_infos(self, infos, source="added"):
+            """Add link infos to the queue (deduplicated). Returns count added."""
+            known = {item.document_id for item in self.items
+                     if item.status in ("pending", "downloading")}
+            fresh = dedupe_infos(infos, known)
+            for info in fresh:
+                self.items.append(QueueItem.from_info(info))
+            if fresh:
+                noun = "document" if len(fresh) == 1 else "documents"
+                self.url_hint.configure(
+                    text=f"✓  {len(fresh)} {noun} {source} to the queue"
+                         + ("." if not self.running else " — will download next."),
+                    text_color=SUCCESS,
+                )
+                self._append_log(f"Queued {len(fresh)} {noun} ({source}).")
+            elif infos:
+                self.url_hint.configure(
+                    text="Those documents are already in the queue.",
+                    text_color=WARNING,
+                )
+            self._persist_pending()
+            self._refresh_queue()
+            self._refresh_actions()
+            return len(fresh)
 
-        def _refresh_download_button(self):
-            ready = bool(self.parsed) and self.state in ("idle", "success", "error", "cancelled")
-            self.download_btn.configure(state="normal" if ready else "disabled")
+        def _add_from_entry(self):
+            infos = self.engine.extract_scribd_urls(self.url_var.get())
+            if not infos:
+                self._validate_url()
+                self.url_entry.focus_set()
+                return
+            self._add_infos(infos)
+            self.url_var.set("")
+            self._validate_url()
+            self.url_entry.focus_set()
 
         def _paste_from_clipboard(self):
             try:
-                text = self.clipboard_get().strip()
+                text = self.clipboard_get()
             except tk.TclError:
                 text = ""
-            if text:
-                self.url_var.set(text)
-                self.filename_dirty = False
+            infos = self.engine.extract_scribd_urls(text)
+            if len(infos) > 1:
+                self._add_infos(infos, source="pasted")
+            elif infos:
+                self.url_var.set(text.strip())
                 self._validate_url()
                 self.url_entry.focus_set()
             else:
                 self.url_hint.configure(
-                    text="Clipboard is empty — copy a Scribd link first.",
+                    text="Clipboard doesn't contain a Scribd link — copy one first.",
                     text_color=WARNING,
                 )
 
+        def _on_entry_paste(self, _event):
+            """Ctrl+V of several links adds them all instead of filling the box."""
+            try:
+                text = self.clipboard_get()
+            except tk.TclError:
+                return None
+            infos = self.engine.extract_scribd_urls(text)
+            if len(infos) > 1:
+                self._add_infos(infos, source="pasted")
+                return "break"
+            return None
+
         def _check_clipboard(self):
-            """Offer a Scribd link that is already on the clipboard."""
-            if not self.settings.clipboard_check or self.state in ("downloading", "cancelling"):
+            """Offer Scribd link(s) that are already on the clipboard."""
+            if not self.settings.clipboard_check:
                 return
             try:
                 text = self.clipboard_get().strip()
@@ -840,20 +1115,210 @@ if ctk is not None:
             if not text or text == self._last_clipboard:
                 return
             self._last_clipboard = text
-            if not self.url_var.get().strip() and self.engine.parse_scribd_url(text):
+            infos = self.engine.extract_scribd_urls(text)
+            if not infos or self.url_var.get().strip():
+                return
+            if len(infos) > 1:
+                if not self.items:
+                    self._add_infos(infos, source="taken from your clipboard")
+            else:
                 self.url_var.set(text)
-                self.filename_dirty = False
                 self._validate_url()
                 self.url_hint.configure(
-                    text="✓  Scribd link taken from your clipboard — press Download when ready.",
+                    text="✓  Scribd link taken from your clipboard — Enter to queue it.",
                     text_color=SUCCESS,
                 )
 
-        def _clear_url(self):
-            self.url_var.set("")
-            self.filename_dirty = False
-            self._validate_url()
-            self.url_entry.focus_set()
+        def _import_link_files(self):
+            paths = filedialog.askopenfilenames(
+                title="Choose file(s) containing Scribd links",
+                filetypes=[
+                    ("Link files", "*.txt *.url *.md *.csv *.html"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if not paths:
+                return
+            infos = read_urls_from_files(self.engine, list(paths))
+            if infos:
+                self._add_infos(infos, source="imported")
+            else:
+                self.url_hint.configure(
+                    text="No Scribd links found in the selected file(s).",
+                    text_color=WARNING,
+                )
+
+        # ---------------------------------------------------------- queue UI
+        def _item_subtext(self, item):
+            if item.status == "failed" and item.detail:
+                return item.detail
+            if item.status == "skipped":
+                return f"{item.filename}  ·  skipped (file already exists)"
+            if item.status == "done" and item.output_path:
+                try:
+                    size = human_size(Path(item.output_path).stat().st_size)
+                    return f"{Path(item.output_path).name}  ·  {size}"
+                except OSError:
+                    pass
+            return f"{item.filename}  ·  ID {item.document_id}"
+
+        def _refresh_queue(self):
+            """Rebuild queue rows from the model (not called on progress ticks)."""
+            for child in self.queue_list.winfo_children():
+                child.destroy()
+            self.row_refs = {}
+
+            pending = sum(1 for i in self.items if i.status == "pending")
+            done = sum(1 for i in self.items if i.status == "done")
+            self.queue_title.configure(
+                text=f"Queue  ({len(self.items)})"
+                     + (f"  ·  {pending} waiting" if pending else "")
+                     + (f"  ·  {done} saved" if done else "")
+            )
+
+            if not self.items:
+                empty_text = "No documents queued yet.\nPaste Scribd links above"
+                if self.dnd_enabled:
+                    empty_text += ", or drop links / .txt files anywhere in this window."
+                else:
+                    empty_text += ", or import a .txt file of links."
+                ctk.CTkLabel(
+                    self.queue_list, text=empty_text, font=self._font(12),
+                    text_color=TEXT_MUTED, justify="center",
+                ).pack(pady=(26, 26))
+                return
+
+            for item in self.items:
+                row = ctk.CTkFrame(
+                    self.queue_list, fg_color=FIELD_BG,
+                    border_color=CARD_BORDER, border_width=1, corner_radius=10,
+                )
+                row.pack(fill="x", padx=4, pady=3)
+
+                dot = ctk.CTkLabel(
+                    row, text="●", width=20, font=self._font(13),
+                    text_color=STATUS_COLORS.get(item.status, TEXT_MUTED),
+                )
+                dot.pack(side="left", padx=(10, 2), pady=8)
+
+                texts = ctk.CTkFrame(row, fg_color="transparent")
+                texts.pack(side="left", fill="x", expand=True, pady=6)
+                ctk.CTkLabel(
+                    texts, text=item.title, font=self._font(12, "bold"),
+                    anchor="w", wraplength=520,
+                ).pack(fill="x")
+                sub = ctk.CTkLabel(
+                    texts, text=self._item_subtext(item), font=self._font(11),
+                    text_color=ERROR if item.status == "failed" else TEXT_MUTED,
+                    anchor="w", wraplength=520,
+                )
+                sub.pack(fill="x")
+
+                pct = ctk.CTkLabel(
+                    row, text=f"{item.percent}%" if item.status == "downloading" else "",
+                    width=46, font=self._font(12, "bold"), text_color=TEXT_MUTED,
+                )
+                pct.pack(side="left")
+                self.row_refs[item.document_id] = {"dot": dot, "sub": sub, "pct": pct}
+
+                if item.status == "pending":
+                    self._ghost_button(
+                        row, "Edit", 54,
+                        lambda it=item: self._edit_item_filename(it), height=30,
+                    ).pack(side="left", padx=(0, 6), pady=8)
+                if item.status in ("failed", "cancelled"):
+                    self._ghost_button(
+                        row, "Retry", 58,
+                        lambda it=item: self._retry_item(it), height=30,
+                    ).pack(side="left", padx=(0, 6), pady=8)
+                if item.status == "done" and item.output_path:
+                    self._ghost_button(
+                        row, "Open", 58,
+                        lambda it=item: open_file(it.output_path), height=30,
+                    ).pack(side="left", padx=(0, 6), pady=8)
+                if item.status != "downloading":
+                    self._ghost_button(
+                        row, "✕", 34,
+                        lambda it=item: self._remove_item(it), height=30,
+                    ).pack(side="left", padx=(0, 8), pady=8)
+
+        def _update_row(self, item):
+            refs = self.row_refs.get(item.document_id)
+            if not refs:
+                self._refresh_queue()
+                return
+            refs["dot"].configure(
+                text_color=STATUS_COLORS.get(item.status, TEXT_MUTED)
+            )
+            refs["sub"].configure(text=self._item_subtext(item))
+            refs["pct"].configure(
+                text=f"{item.percent}%" if item.status == "downloading" else ""
+            )
+
+        def _remove_item(self, item):
+            if item.status == "downloading":
+                return
+            self.items = [i for i in self.items if i is not item]
+            self._persist_pending()
+            self._refresh_queue()
+            self._refresh_actions()
+
+        def _clear_items(self, statuses):
+            if self.running and "pending" in statuses:
+                return  # don't yank the queue mid-run; ✕ works per row instead
+            self.items = [
+                i for i in self.items
+                if i.status not in statuses or i.status == "downloading"
+            ]
+            self.result_panel.pack_forget()
+            self._persist_pending()
+            self._refresh_queue()
+            self._refresh_actions()
+
+        def _retry_item(self, item):
+            item.status = "pending"
+            item.detail = ""
+            item.percent = 0
+            self._persist_pending()
+            self._refresh_queue()
+            self._refresh_actions()
+            if not self.running:
+                self._start_queue()
+
+        def _edit_item_filename(self, item):
+            dialog = ctk.CTkInputDialog(
+                text="File name for this PDF (“.pdf” is added automatically):",
+                title="Rename PDF",
+            )
+            value = dialog.get_input()
+            if value and value.strip():
+                stem = self.engine.sanitize_filename(value.strip())
+                item.filename = f"{stem}.pdf"
+                self._persist_pending()
+                self._refresh_queue()
+
+        def _persist_pending(self):
+            self.settings.pending_queue = [
+                {"source_url": i.source_url, "filename": i.filename}
+                for i in self.items
+                if i.status in ("pending", "downloading")
+            ]
+            self.settings.save()
+
+        def _restore_pending_queue(self):
+            for entry in self.settings.pending_queue:
+                info = self.engine.parse_scribd_url(entry.get("source_url", ""))
+                if not info:
+                    continue
+                item = QueueItem.from_info(info)
+                if entry.get("filename"):
+                    item.filename = entry["filename"]
+                if item.document_id not in {i.document_id for i in self.items}:
+                    self.items.append(item)
+            if self.items:
+                self._append_log(
+                    f"Restored {len(self.items)} queued document(s) from last time."
+                )
 
         # ---------------------------------------------------------- saving
         def _browse_folder(self):
@@ -866,217 +1331,270 @@ if ctk is not None:
                 self.settings.output_dir = chosen
                 self.settings.save()
 
-        def _resolved_output_path(self):
-            name = self.engine.sanitize_filename(self.filename_var.get().strip())
-            folder = Path(self.folder_var.get().strip() or default_downloads_dir())
-            return folder / f"{name}.pdf"
+        # ---------------------------------------------------------- queue worker
+        def _pending_count(self):
+            return sum(1 for i in self.items if i.status == "pending")
 
-        def _update_path_preview(self):
-            if not hasattr(self, "path_preview"):
+        def _refresh_actions(self):
+            if self.running:
+                self.download_btn.pack_forget()
+                self.running_row.pack(fill="x")
                 return
-            self.path_preview.configure(text=f"Will save to:  {self._resolved_output_path()}")
+            self.running_row.pack_forget()
+            self.download_btn.pack(fill="x")
+            pending = self._pending_count()
+            if pending > 1:
+                self.download_btn.configure(
+                    text=f"Download {pending} PDFs", state="normal"
+                )
+            elif pending == 1:
+                self.download_btn.configure(text="Download PDF", state="normal")
+            elif self.parsed:
+                self.download_btn.configure(text="Add & Download", state="normal")
+            else:
+                self.download_btn.configure(text="Download PDF", state="disabled")
 
-        # ---------------------------------------------------------- download
-        def _start_download(self):
-            if self.state in ("downloading", "cancelling"):
+        def _start_queue(self):
+            if self.running:
                 return
-            self._validate_url()
-            if not self.parsed:
+            # A valid link still in the entry joins the queue first.
+            if self.url_var.get().strip():
+                infos = self.engine.extract_scribd_urls(self.url_var.get())
+                if infos:
+                    self._add_infos(infos)
+                    self.url_var.set("")
+                    self._validate_url()
+            if self._pending_count() == 0:
                 self.url_entry.focus_set()
                 return
 
-            output = self._resolved_output_path()
-            if output.exists():
-                choice = self._ask_overwrite(output)
-                if choice == "cancel":
-                    return
-                if choice == "copy":
-                    output = unique_path(output)
-
-            self.output_path = output
-            self.output_existed_before = output.exists()
-            self.settings.output_dir = str(output.parent)
+            folder = Path(self.folder_var.get().strip() or default_downloads_dir())
+            self.settings.output_dir = str(folder)
             self.settings.save()
 
-            self.cancel_event = threading.Event()
-            self.started_at = time.monotonic()
-            self.export_started_at = None
-            self.last_progress = {}
-            self._set_state("downloading")
-            self._append_log(f"\n--- {time.strftime('%H:%M:%S')}  {output.name} ---")
-            self._apply_progress({"stage": "connect", "message": "Starting Chrome..."})
+            self.queue_stop = threading.Event()
+            self.running = True
+            self.run_stats = {"done": 0, "failed": 0, "skipped": 0, "cancelled": 0}
+            self.result_panel.pack_forget()
+            self.progress_card.pack(
+                fill="x", pady=(0, 14), after=self.action_frame
+            )
+            self._set_input_enabled(False)
+            self._refresh_actions()
+            self._append_log(
+                f"\n--- Queue started {time.strftime('%H:%M:%S')} · "
+                f"{self._pending_count()} document(s) · saving to {folder} ---"
+            )
+            self.worker = threading.Thread(
+                target=self._queue_worker,
+                args=(folder, self.settings.conflict_policy),
+                daemon=True,
+                name="scribd-queue",
+            )
+            self.worker.start()
 
-            url = self.url_var.get().strip()
+        def _set_input_enabled(self, enabled):
+            # The URL entry stays usable while downloading so more links can
+            # be queued; only destination controls lock (folder is snapshotted).
+            state = "normal" if enabled else "disabled"
+            for widget in (self.folder_entry, self.browse_btn, self.clear_all_btn):
+                widget.configure(state=state)
+
+        def _queue_worker(self, folder, policy):
+            """Sequentially download pending items. Data-only thread: every
+            widget change is posted to the main thread via ``self.events``."""
             settings = self.settings
-            cancel_event = self.cancel_event
+            while not self.queue_stop.is_set():
+                item = next(
+                    (i for i in list(self.items) if i.status == "pending"), None
+                )
+                if item is None:
+                    break
 
-            def work():
+                item.status = "downloading"
+                item.percent = 0
+                item.detail = ""
+                output = folder / item.filename
+                existed_before = output.exists()
+                if existed_before and policy == "skip":
+                    item.status = "skipped"
+                    item.output_path = output
+                    self.events.put(("item_skipped", item))
+                    continue
+                if existed_before and policy == "copy":
+                    output = unique_path(output)
+                item.output_path = output
+
+                cancel_event = threading.Event()
+                self.current_cancel = cancel_event
+                doc_id = item.document_id
+                self.events.put(("item_started", item))
                 try:
                     saved = self.engine.download_document(
-                        url,
+                        item.source_url,
                         str(output),
                         on_log=lambda line: self.events.put(("log", line)),
-                        on_progress=lambda info: self.events.put(("progress", info)),
+                        on_progress=lambda info, d=doc_id: self.events.put(
+                            ("progress", (d, info))
+                        ),
                         cancel_event=cancel_event,
                         headless=not settings.show_browser,
                         batch_size=settings.batch_size,
                         page_load_timeout=settings.page_load_timeout,
                         cdp_timeout=settings.cdp_timeout,
                     )
-                    self.events.put(("success", saved))
+                    item.status = "done"
+                    item.percent = 100
+                    item.output_path = Path(saved)
+                    self.events.put(("item_done", item))
                 except self.engine.DownloadCancelledError:
-                    self.events.put(("cancelled", None))
+                    item.status = "cancelled"
+                    self._cleanup_partial(output, existed_before)
+                    self.events.put(("item_cancelled", item))
                 except Exception as error:  # noqa: BLE001 - shown to the user
-                    self.events.put(("error", error))
+                    item.status = "failed"
+                    item.detail = friendly_error(error)
+                    self._cleanup_partial(output, existed_before)
+                    self.events.put(("item_failed", (item, error)))
+                finally:
+                    self.current_cancel = None
 
-            self.worker = threading.Thread(target=work, daemon=True, name="scribd-download")
-            self.worker.start()
-            self._tick_timing()
+            self.events.put(("queue_finished", None))
 
-        def _cancel_download(self):
-            if self.state != "downloading":
+        @staticmethod
+        def _cleanup_partial(output, existed_before):
+            """Remove an incomplete file created by this run (merge writes last)."""
+            try:
+                if not existed_before and Path(output).is_file():
+                    Path(output).unlink()
+            except OSError:
+                pass
+
+        def _skip_current(self):
+            if self.running and self.current_cancel is not None:
+                self.status_label.configure(
+                    text="Skipping — finishing the current page…"
+                )
+                self.current_cancel.set()
+
+        def _stop_queue(self):
+            if not self.running:
                 return
-            self.cancel_event.set()
-            self.state = "cancelling"
-            self.cancel_btn.configure(state="disabled", text="Cancelling…")
-            self.status_label.configure(text="Cancelling — finishing the current page…")
+            self.queue_stop.set()
+            if self.current_cancel is not None:
+                self.current_cancel.set()
+            self.stop_btn.configure(state="disabled", text="Stopping…")
+            self.status_label.configure(
+                text="Stopping queue — finishing the current page…"
+            )
 
-        def _ask_overwrite(self, path):
-            """Modal choice: Overwrite / Save as copy / Cancel. Returns str."""
-            dialog = ctk.CTkToplevel(self)
-            dialog.title("File already exists")
-            dialog.geometry("460x190")
-            dialog.resizable(False, False)
-            dialog.configure(fg_color=WINDOW_BG)
-            dialog.transient(self)
-            result = {"choice": "cancel"}
+        # ---------------------------------------------------------- worker events
+        def _poll_events(self):
+            try:
+                while True:
+                    kind, payload = self.events.get_nowait()
+                    if kind == "log":
+                        self._append_log(payload)
+                    elif kind == "progress":
+                        doc_id, info = payload
+                        if self.running:
+                            self._apply_progress(doc_id, info)
+                    elif kind == "item_started":
+                        self.current_item = payload
+                        self.started_at = time.monotonic()
+                        self.export_started_at = None
+                        self.last_progress = {}
+                        index = self.items.index(payload) + 1 if payload in self.items else 1
+                        self.overall_label.configure(
+                            text=f"Document {index} of {len(self.items)} — {payload.title}"
+                        )
+                        self._reset_steps()
+                        self.progress_bar.set(0)
+                        self._update_row(payload)
+                        self._tick_timing()
+                    elif kind == "item_done":
+                        self.run_stats["done"] += 1
+                        self.last_saved_path = payload.output_path
+                        self.settings.add_recent(payload.output_path, payload.title)
+                        self._refresh_recents()
+                        self._refresh_queue()
+                        self._persist_pending()
+                    elif kind == "item_skipped":
+                        self.run_stats["skipped"] += 1
+                        self._append_log(f"Skipped (already exists): {payload.filename}")
+                        self._refresh_queue()
+                        self._persist_pending()
+                    elif kind == "item_cancelled":
+                        self.run_stats["cancelled"] += 1
+                        self._append_log(f"Cancelled: {payload.title}")
+                        self._refresh_queue()
+                        self._persist_pending()
+                    elif kind == "item_failed":
+                        item, error = payload
+                        self.run_stats["failed"] += 1
+                        self._append_log(f"ERROR ({item.title}): {error}")
+                        self._refresh_queue()
+                        self._persist_pending()
+                        if not self.log_visible:
+                            self._toggle_log()
+                    elif kind == "queue_finished":
+                        self._on_queue_finished()
+            except queue.Empty:
+                pass
+            self.after(80, self._poll_events)
 
-            ctk.CTkLabel(
-                dialog, text="A file with this name already exists:",
-                font=self._font(13, "bold"), anchor="w",
-            ).pack(fill="x", padx=20, pady=(18, 4))
-            ctk.CTkLabel(
-                dialog, text=str(path), font=self._font(12),
-                text_color=TEXT_MUTED, anchor="w", wraplength=420,
-            ).pack(fill="x", padx=20)
+        def _on_queue_finished(self):
+            self.running = False
+            self.current_item = None
+            self.progress_bar.stop()
+            self.stop_btn.configure(state="normal", text="Stop queue")
+            self._set_input_enabled(True)
+            self._persist_pending()
+            self._refresh_queue()
+            self._refresh_actions()
 
-            row = ctk.CTkFrame(dialog, fg_color="transparent")
-            row.pack(fill="x", padx=20, pady=(16, 0))
+            stats = self.run_stats
+            parts = [f"{stats['done']} saved"] if stats["done"] else []
+            if stats["failed"]:
+                parts.append(f"{stats['failed']} failed")
+            if stats["skipped"]:
+                parts.append(f"{stats['skipped']} skipped")
+            if stats["cancelled"]:
+                parts.append(f"{stats['cancelled']} cancelled")
+            if not parts:
+                parts = ["nothing downloaded"]
+            remaining = self._pending_count()
+            stopped = " (stopped early)" if remaining and self.queue_stop.is_set() else ""
 
-            def choose(value):
-                result["choice"] = value
-                dialog.destroy()
-
-            ctk.CTkButton(
-                row, text="Overwrite", width=110, height=36, font=self._font(12, "bold"),
-                fg_color=ERROR, hover_color=ERROR, text_color="white",
-                command=lambda: choose("overwrite"),
-            ).pack(side="left")
-            ctk.CTkButton(
-                row, text="Save as copy", width=120, height=36, font=self._font(12),
-                fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="white",
-                command=lambda: choose("copy"),
-            ).pack(side="left", padx=(8, 0))
-            ctk.CTkButton(
-                row, text="Cancel", width=90, height=36, font=self._font(12),
-                fg_color="transparent", hover_color=FIELD_BG,
-                border_color=FIELD_BORDER, border_width=1,
-                text_color=("#1A1D21", "#E8EAED"), command=lambda: choose("cancel"),
-            ).pack(side="left", padx=(8, 0))
-
-            dialog.update_idletasks()
-            x = self.winfo_rootx() + (self.winfo_width() - 460) // 2
-            y = self.winfo_rooty() + (self.winfo_height() - 190) // 2
-            dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
-            dialog.grab_set()
-            self.wait_window(dialog)
-            return result["choice"]
-
-        # ---------------------------------------------------------- states
-        def _set_input_enabled(self, enabled):
-            state = "normal" if enabled else "disabled"
-            for widget in (
-                self.url_entry, self.paste_btn, self.clear_btn,
-                self.filename_entry, self.folder_entry, self.browse_btn,
-            ):
-                widget.configure(state=state)
-
-        def _set_state(self, state, error=None):
-            self.state = state
-            if state == "downloading":
-                self._set_input_enabled(False)
-                self.download_btn.pack_forget()
-                self.cancel_btn.configure(state="normal", text="Cancel download")
-                self.cancel_btn.pack(fill="x")
-                self.result_panel.pack_forget()
-                self.progress_card.pack(fill="x", pady=(0, 14), after=self.action_frame)
-                self.progress_bar.set(0)
-                self._reset_steps()
-            elif state in ("success", "error", "cancelled", "idle"):
-                self._set_input_enabled(True)
-                self.cancel_btn.pack_forget()
-                self.download_btn.pack(fill="x")
-                self.progress_bar.stop()
-                if state == "idle":
-                    self.progress_card.pack_forget()
-                    self.result_panel.pack_forget()
-                else:
-                    self._show_result(state, error)
-            self._refresh_download_button()
-
-        def _show_result(self, state, error=None):
-            # Swap the Download button for contextual actions.
-            self.download_btn.pack_forget()
-            self.open_pdf_btn.pack_forget()
-            self.open_folder_btn.pack_forget()
-            self.retry_btn.pack_forget()
-
-            if state == "success":
-                size = ""
-                try:
-                    size = f"  ·  {human_size(Path(self.output_path).stat().st_size)}"
-                except OSError:
-                    pass
-                elapsed = format_duration(time.monotonic() - (self.started_at or time.monotonic()))
-                self.result_title.configure(
-                    text=f"✓  Saved in {elapsed}{size}", text_color=SUCCESS
-                )
-                self.result_detail.configure(text=str(self.output_path))
-                self.open_pdf_btn.pack(side="left", before=self.new_download_btn)
-                self.open_folder_btn.pack(side="left", padx=(8, 0), before=self.new_download_btn)
-                self.progress_bar.configure(mode="determinate")
-                self.progress_bar.set(1)
-                self._mark_stage("done")
-                self.status_label.configure(text="Done — PDF saved successfully.")
-            elif state == "error":
-                self.result_title.configure(text="Download failed", text_color=ERROR)
-                self.result_detail.configure(text=friendly_error(error))
-                self.retry_btn.configure(text="Try again")
-                self.retry_btn.pack(side="left", before=self.new_download_btn)
-                self.status_label.configure(text="Failed — see the activity log for details.")
-                if not self.log_visible:
-                    self._toggle_log()
-            elif state == "cancelled":
-                self.result_title.configure(text="Download cancelled", text_color=WARNING)
-                self.result_detail.configure(
-                    text="Nothing was saved. You can adjust the link or try again."
-                )
-                self.retry_btn.configure(text="Download again")
-                self.retry_btn.pack(side="left", before=self.new_download_btn)
-                self.status_label.configure(text="Cancelled.")
-
+            all_ok = stats["done"] and not (stats["failed"] or stats["cancelled"])
+            self.result_title.configure(
+                text=f"{'✓' if all_ok else 'Queue finished'}  "
+                     f"{', '.join(parts)}{stopped}",
+                text_color=SUCCESS if all_ok else TEXT_MAIN,
+            )
+            self.result_detail.configure(
+                text=f"Saved to {self.folder_var.get()}"
+                     + (f"  ·  {remaining} still waiting — press Download to continue."
+                        if remaining else
+                        "  ·  Open any PDF from its queue row or Recent downloads.")
+            )
+            self.open_last_btn.configure(
+                state="normal" if self.last_saved_path else "disabled"
+            )
             self.result_panel.pack(fill="x", pady=(0, 14), after=self.action_frame)
-            # Keep the progress card directly under the result panel.
             self.progress_card.pack_forget()
             self.progress_card.pack(fill="x", pady=(0, 14), after=self.result_panel)
+            self.status_label.configure(text="Queue finished.")
+            self._append_log(f"--- Queue finished: {', '.join(parts)} ---")
 
-        def _reset_form(self):
-            self.url_var.set("")
-            self.filename_dirty = False
-            self.retry_btn.configure(text="Try again")
-            self._set_state("idle")
-            self._validate_url()
-            self.url_entry.focus_set()
+            # Open-when-done only makes sense for a single-document run.
+            if (
+                self.settings.open_when_done
+                and stats["done"] == 1
+                and not (stats["failed"] or stats["skipped"] or stats["cancelled"])
+                and self.last_saved_path is not None
+            ):
+                open_file(self.last_saved_path)
 
         # ---------------------------------------------------------- progress
         def _reset_steps(self):
@@ -1085,10 +1603,7 @@ if ctk is not None:
                 label.configure(text_color=TEXT_MUTED, font=self._font(12))
 
         def _mark_stage(self, stage):
-            if stage == "done":
-                active_index = len(STAGES)
-            else:
-                active_index = STAGES.index(stage)
+            active_index = len(STAGES) if stage == "done" else STAGES.index(stage)
             for index, name in enumerate(STAGES):
                 dot, label = self.step_widgets[name]
                 if index < active_index:
@@ -1096,21 +1611,28 @@ if ctk is not None:
                     label.configure(text_color=TEXT_MUTED, font=self._font(12))
                 elif index == active_index:
                     dot.configure(text=str(index + 1), fg_color=ACCENT)
-                    label.configure(
-                        text_color=("#1A1D21", "#E8EAED"), font=self._font(12, "bold")
-                    )
+                    label.configure(text_color=TEXT_MAIN, font=self._font(12, "bold"))
                 else:
                     dot.configure(text=str(index + 1), fg_color=FIELD_BORDER)
                     label.configure(text_color=TEXT_MUTED, font=self._font(12))
 
-        def _apply_progress(self, info):
+        def _apply_progress(self, doc_id, info):
             self.last_progress = info
             stage = info.get("stage") or "export"
             current, total = info.get("current"), info.get("total")
             message = info.get("message") or ""
 
+            if self.current_item is not None and self.current_item.document_id == doc_id:
+                if stage == "export" and total:
+                    self.current_item.percent = int(round(100 * (current or 0) / total))
+                elif stage == "done":
+                    self.current_item.percent = 100
+                self._update_row(self.current_item)
+
             if stage in STAGES:
                 self._mark_stage(stage)
+            elif stage == "done":
+                self._mark_stage("done")
             if stage == "export" and self.export_started_at is None:
                 self.export_started_at = time.monotonic()
 
@@ -1120,7 +1642,7 @@ if ctk is not None:
             else:
                 self.progress_bar.stop()
                 self.progress_bar.configure(mode="determinate")
-                self.progress_bar.set(current / total if total else 0)
+                self.progress_bar.set((current or 0) / total if total else 0)
 
             if stage == "export" and current is not None and total:
                 percent = int(round(100 * current / total))
@@ -1131,10 +1653,10 @@ if ctk is not None:
                 self.status_label.configure(text=message)
 
         def _tick_timing(self):
-            if self.state not in ("downloading", "cancelling"):
+            if not self.running:
                 return
             elapsed = time.monotonic() - (self.started_at or time.monotonic())
-            text = f"Elapsed {format_duration(elapsed)}"
+            text = f"This document: {format_duration(elapsed)}"
             info = self.last_progress
             current, total = info.get("current"), info.get("total")
             if (
@@ -1148,47 +1670,6 @@ if ctk is not None:
                 text += f"  ·  about {format_duration(per_page * (total - current))} left"
             self.timing_label.configure(text=text)
             self.after(500, self._tick_timing)
-
-        # ---------------------------------------------------------- worker events
-        def _poll_events(self):
-            try:
-                while True:
-                    kind, payload = self.events.get_nowait()
-                    if kind == "log":
-                        self._append_log(payload)
-                    elif kind == "progress":
-                        if self.state in ("downloading", "cancelling"):
-                            self._apply_progress(payload)
-                    elif kind == "success":
-                        self.output_path = Path(payload)
-                        title = (self.parsed or {}).get("title") or self.output_path.stem
-                        self.settings.add_recent(payload, title)
-                        self._refresh_recents()
-                        self._set_state("success")
-                        if self.settings.open_when_done:
-                            open_file(self.output_path)
-                    elif kind == "cancelled":
-                        self._cleanup_partial()
-                        self._set_state("cancelled")
-                    elif kind == "error":
-                        self._append_log(f"ERROR: {payload}")
-                        self._cleanup_partial()
-                        self._set_state("error", error=payload)
-            except queue.Empty:
-                pass
-            self.after(80, self._poll_events)
-
-        def _cleanup_partial(self):
-            """Remove an incomplete file created by this run (merge writes last)."""
-            try:
-                if (
-                    self.output_path
-                    and not self.output_existed_before
-                    and Path(self.output_path).is_file()
-                ):
-                    Path(self.output_path).unlink()
-            except OSError:
-                pass
 
         # ---------------------------------------------------------- log
         def _append_log(self, line):
@@ -1206,7 +1687,6 @@ if ctk is not None:
                 self.copy_log_btn.pack(side="right")
                 self.clear_log_btn.pack(side="right")
                 self.log_box.pack(fill="x", pady=(0, 6))
-                # Keep recents below the log.
                 self.recents_frame.pack_forget()
                 self.recents_frame.pack(fill="x", pady=(10, 0))
             else:
@@ -1238,18 +1718,17 @@ if ctk is not None:
                 self.recents_frame, text="Recent downloads",
                 font=self._font(12, "bold"), text_color=TEXT_MUTED, anchor="w",
             ).pack(fill="x", pady=(0, 4))
-            for item in existing[:4]:
-                path = Path(item["path"])
+            for entry in existing[:4]:
+                path = Path(entry["path"])
                 row = ctk.CTkFrame(self.recents_frame, fg_color="transparent")
                 row.pack(fill="x", pady=1)
-                date_text = time.strftime("%b %d", time.localtime(item.get("ts", 0)))
-                name_btn = ctk.CTkButton(
-                    row, text=f"{path.name}", font=self._font(12),
+                date_text = time.strftime("%b %d", time.localtime(entry.get("ts", 0)))
+                ctk.CTkButton(
+                    row, text=path.name, font=self._font(12),
                     fg_color="transparent", hover_color=FIELD_BG,
-                    text_color=("#1A1D21", "#E8EAED"), anchor="w",
+                    text_color=TEXT_MAIN, anchor="w",
                     command=lambda p=path: open_file(p),
-                )
-                name_btn.pack(side="left", fill="x", expand=True)
+                ).pack(side="left", fill="x", expand=True)
                 ctk.CTkLabel(
                     row, text=date_text, font=self._font(11), text_color=TEXT_MUTED
                 ).pack(side="left", padx=(0, 6))
@@ -1291,7 +1770,10 @@ if ctk is not None:
                 body, values=["4", "8", "16"], font=self._font(12),
                 selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
             )
-            batch.set(str(self.settings.batch_size) if str(self.settings.batch_size) in ("4", "8", "16") else "8")
+            batch.set(
+                str(self.settings.batch_size)
+                if str(self.settings.batch_size) in ("4", "8", "16") else "8"
+            )
             batch.pack(fill="x")
             caption("Lower uses less memory on image-heavy documents. 8 is a good default.")
 
@@ -1321,7 +1803,7 @@ if ctk is not None:
             if self.settings.show_browser:
                 show_browser.select()
             open_done = ctk.CTkSwitch(
-                body, text="Open the PDF when the download finishes",
+                body, text="Open the PDF when a single download finishes",
                 font=self._font(12), progress_color=ACCENT,
             )
             open_done.pack(fill="x", pady=4)
@@ -1367,12 +1849,9 @@ if ctk is not None:
                 fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="white",
                 command=save,
             ).pack(side="right")
-            ctk.CTkButton(
-                row, text="Cancel", width=100, height=38, font=self._font(12),
-                fg_color="transparent", hover_color=FIELD_BG,
-                border_color=FIELD_BORDER, border_width=1,
-                text_color=("#1A1D21", "#E8EAED"), command=dialog.destroy,
-            ).pack(side="right", padx=(0, 8))
+            self._ghost_button(row, "Cancel", 100, dialog.destroy).pack(
+                side="right", padx=(0, 8)
+            )
 
             dialog.update_idletasks()
             x = self.winfo_rootx() + (self.winfo_width() - 500) // 2
@@ -1383,17 +1862,19 @@ if ctk is not None:
 
         # ---------------------------------------------------------- close
         def _on_close(self):
-            if self.state in ("downloading", "cancelling"):
+            if self.running:
                 if not messagebox.askyesno(
                     APP_NAME,
-                    "A download is in progress. Quit anyway?\n\n"
-                    "The partial download will be discarded.",
+                    "The queue is downloading. Quit anyway?\n\n"
+                    "Unfinished documents stay in the queue for next time.",
                     parent=self,
                 ):
                     return
-                self.cancel_event.set()
+                self.queue_stop.set()
+                if self.current_cancel is not None:
+                    self.current_cancel.set()
             self.settings.output_dir = self.folder_var.get() or self.settings.output_dir
-            self.settings.save()
+            self._persist_pending()
             self.destroy()
 
 

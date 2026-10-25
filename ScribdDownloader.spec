@@ -11,6 +11,7 @@ Notes
   ``sys._MEIPASS`` at runtime (its hyphenated name can't be imported).
 * Selenium must be collected with its bundled ``selenium-manager`` binaries.
 * CustomTkinter ships theme JSON/assets that must be bundled as a folder.
+* tkinterdnd2 ships the native tkdnd Tcl/Tk libraries per platform.
 * Chrome itself is NOT bundled (as with the CLI): the user needs Google
   Chrome installed; Selenium Manager fetches the matching ChromeDriver.
 """
@@ -31,7 +32,7 @@ datas = [
 binaries = []
 hiddenimports = []
 
-for package in ("selenium", "customtkinter", "pypdf"):
+for package in ("selenium", "customtkinter", "pypdf", "tkinterdnd2"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries
@@ -76,5 +77,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(project / "assets" / "icon.ico"),
-    version_file=None,
+    version=str(project / "version_info.txt"),
 )

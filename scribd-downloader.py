@@ -205,7 +205,37 @@ def parse_scribd_url(url):
         "title": title,
         "embed_url": f"https://www.scribd.com/embeds/{document_id}/content",
         "filename": f"{sanitize_filename(filename_slug)}.pdf",
+        "source_url": (
+            f"https://www.scribd.com/document/{document_id}"
+            + (f"/{match.group(2)}" if match.group(2) and slug else "")
+        ),
     }
+
+
+def extract_scribd_urls(text):
+    """Extract every distinct Scribd document found in ``text``.
+
+    Used for multi-link paste, drag-&-drop and .txt link files. Returns a
+    list of :func:`parse_scribd_url` dicts deduplicated by document id,
+    in first-seen order. The ``(Scribd)`` suffix some browsers append to
+    dragged link text and surrounding prose are ignored naturally.
+    """
+    if not text:
+        return []
+    found = []
+    seen_ids = set()
+    for match in _SCRIBD_URL_RE.finditer(str(text)):
+        parsed = parse_scribd_url(match.group(0))
+        if not parsed or parsed["document_id"] in seen_ids:
+            continue
+        seen_ids.add(parsed["document_id"])
+        # Keep a canonical source URL so callers can re-download later.
+        parsed["source_url"] = (
+            f"https://www.scribd.com/document/{parsed['document_id']}"
+            + (f"/{match.group(2)}" if match.group(2) and match.group(2).lower() != "content" else "")
+        )
+        found.append(parsed)
+    return found
 
 
 def convert_scribd_link(url):

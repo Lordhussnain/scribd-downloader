@@ -9,4 +9,5 @@ pypdf>=6.0
 
 # Desktop GUI (gui_app.py) — not needed for CLI-only use
 customtkinter>=5.2.2
+tkinterdnd2>=0.4.2
 Pillow>=10.0

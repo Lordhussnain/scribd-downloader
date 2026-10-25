@@ -68,6 +68,26 @@ class ParseScribdUrlTests(unittest.TestCase):
         )
 
 
+class ExtractScribdUrlsTests(unittest.TestCase):
+    def test_extracts_multiple_and_dedupes(self):
+        text = (
+            "https://www.scribd.com/document/111/Alpha-Doc\n"
+            "see https://de.scribd.com/doc/222/Beta and "
+            "https://www.scribd.com/document/111/Alpha-Doc again\n"
+            "https://www.scribd.com/embeds/333/content\n"
+            "https://example.com/document/9/x"
+        )
+        found = engine.extract_scribd_urls(text)
+        self.assertEqual([d["document_id"] for d in found], ["111", "222", "333"])
+        self.assertEqual(found[0]["source_url"],
+                         "https://www.scribd.com/document/111/Alpha-Doc")
+        self.assertEqual(found[2]["filename"], "scribd-333.pdf")
+
+    def test_empty_and_no_links(self):
+        self.assertEqual(engine.extract_scribd_urls(""), [])
+        self.assertEqual(engine.extract_scribd_urls("nothing here"), [])
+
+
 class SanitizeFilenameTests(unittest.TestCase):
     def test_windows_illegal_characters(self):
         cleaned = engine.sanitize_filename('a<b>:"/\\|?*c')

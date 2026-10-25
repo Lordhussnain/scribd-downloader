@@ -45,6 +45,26 @@ def draw_icon(size=SIZE):
     return image
 
 
+def draw_wizard_images(assets, icon):
+    """Inno Setup wizard side (164x314) and small (55x55) images, as BMP."""
+    folder = assets / "installer"
+    folder.mkdir(exist_ok=True)
+
+    deep_teal = (7, 47, 51)
+    side = Image.new("RGB", (164, 314), deep_teal)
+    draw = ImageDraw.Draw(side)
+    draw.rectangle([0, 288, 164, 314], fill=TEAL[:3])
+    mark = icon.resize((128, 128), Image.LANCZOS)
+    side.paste(mark, (18, 36), mark)
+    side.save(folder / "wizard.bmp")
+
+    small = Image.new("RGB", (55, 55), TEAL[:3])
+    mark = icon.resize((47, 47), Image.LANCZOS)
+    small.paste(mark, (4, 4), mark)
+    small.save(folder / "wizard-small.bmp")
+    print(f"Wrote {folder / 'wizard.bmp'} and {folder / 'wizard-small.bmp'}")
+
+
 def main():
     assets = Path(__file__).resolve().parent
     icon = draw_icon()
@@ -55,6 +75,7 @@ def main():
         sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
     )
     print(f"Wrote {assets / 'icon.png'} and {assets / 'icon.ico'}")
+    draw_wizard_images(assets, icon)
 
 
 if __name__ == "__main__":

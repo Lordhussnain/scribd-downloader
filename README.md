@@ -36,7 +36,7 @@
 
 ## Features
 
-- **Windows desktop app** - Clean GUI with live progress, cancellation, recent downloads, and dark/light themes (see below)
+- **Windows desktop app** - Clean GUI with a multi-document **queue**, drag-&-drop, live progress, recent downloads, dark/light themes, and an Inno Setup installer (see below)
 - **One-click download** - Just paste the Scribd URL and get your PDF
 - **Supports both Scribd URL styles** - Works with `/document/...` and legacy `/doc/...` links
 - **Runs in background** - Headless Chrome, no browser window pops up
@@ -97,10 +97,19 @@ build_windows.bat
 
 This installs dependencies, regenerates the icon (`assets/make_icon.py`), runs PyInstaller with `ScribdDownloader.spec`, and self-checks the result at `dist\ScribdDownloader.exe`. Google Chrome still needs to be installed on the target PC (the app shows a “Chrome ready / not found” status in the header).
 
+**Build an installer** (per-user install, Start-menu shortcuts, clean uninstaller — needs [Inno Setup 6](https://jrsoftware.org/isdl.php), or `winget install JRSoftware.InnoSetup`):
+
+```powershell
+build_installer.bat
+```
+
+This builds the `.exe` first, then compiles `installer\ScribdDownloader.iss` to `dist\installer\ScribdDownloader-Setup-<version>.exe`. It installs without admin rights to `%LOCALAPPDATA%\Programs\Scribd Downloader`, upgrades in place, and warns before downgrading over a newer version. Settings and your saved queue in `%APPDATA%\ScribdDownloader` are kept on uninstall.
+
 What you get:
 
-- **Smart paste** — a Scribd link already on your clipboard is detected automatically; links are validated as you type with the document title/ID previewed
-- **Save-as controls** — editable file name (auto-filled, Windows-safe), folder picker, full-path preview, and an Overwrite / Save-as-copy prompt
+- **Download queue** — add as many documents as you like; they download one at a time (keeping Chrome memory bounded) with per-document status, **Skip current / Stop queue**, per-row rename/retry/open, and unfinished items restored on next launch. Existing files follow your *Save as copy / Skip / Overwrite* policy, so batches never stop for prompts
+- **Drag & drop** — drop Scribd links from your browser, or `.txt` / `.url` files full of links, anywhere on the window (a drop overlay confirms); **Add from file…** does the same via a picker. Pasting several links at once queues them all, deduplicated
+- **Smart paste** — Scribd link(s) already on your clipboard are detected automatically; links are validated as you type with the document title/ID previewed
 - **Live progress** — Connect → Load → Export → Merge step indicator, per-page progress bar, elapsed/ETA, and a collapsible activity log you can copy when reporting issues
 - **Cancel safely** — stops between pages and discards incomplete output
 - **Recent downloads** — reopen or reveal the last 5 PDFs in one click
