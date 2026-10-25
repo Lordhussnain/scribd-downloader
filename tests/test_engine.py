@@ -5,6 +5,7 @@ No browser or network is needed.
 """
 
 import importlib.util
+import inspect
 import sys
 import threading
 import unittest
@@ -192,6 +193,195 @@ class WaitForDocumentPagesTests(unittest.TestCase):
             engine._run_state.cancel_event = None
 
 
+
+class LoadPageBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_state = {
+            name: getattr(engine._run_state, name, None)
+            for name in (
+                "cancel_event",
+                "on_progress",
+                "page_load_timeout",
+                "cdp_timeout",
+            )
+        }
+        engine._run_state.cancel_event = None
+        engine._run_state.on_progress = None
+        engine._run_state.page_load_timeout = 10
+        engine._run_state.cdp_timeout = 600
+
+    def tearDown(self):
+        for name, value in self.previous_state.items():
+            setattr(engine._run_state, name, value)
+
+    @staticmethod
+    def status(ready, total=2, total_images=2, pending_images=0):
+        pages = []
+        for index in range(1, total + 1):
+            is_ready = index <= ready
+            pages.append(
+                {
+                    "pageNum": index,
+                    "ready": is_ready,
+                    "reason": "" if is_ready else "3 image(s) still loading",
+                }
+            )
+        return {
+            "supported": True,
+            "total": total,
+            "ready": ready,
+            "totalImages": total_images,
+            "pendingImages": pending_images,
+            "brokenImages": 0,
+            "pages": pages,
+        }
+
+    def test_polls_until_images_are_stably_ready(self):
+        statuses = iter(
+            [
+                self.status(0, pending_images=3),
+                self.status(2),
+                self.status(2),
+            ]
+        )
+        progress = []
+        engine._run_state.on_progress = progress.append
+
+        class Driver:
+            def __init__(self):
+                self.script_timeouts = []
+                self.calls = 0
+
+            def set_script_timeout(self, value):
+                self.script_timeouts.append(value)
+
+            def execute_script(self, _script, _page_numbers):
+                self.calls += 1
+                return next(statuses)
+
+            # Deliberately no execute_async_script: a regression to one long
+            # browser-side wait would fail this test immediately.
+
+        driver = Driver()
+        with mock.patch.object(engine.time, "monotonic", lambda: 0.0), \
+            mock.patch.object(engine.time, "sleep", lambda _seconds: None):
+            engine.load_page_batch(
+                driver,
+                [1, 2],
+                progress_current=0,
+                progress_total=215,
+            )
+
+        self.assertEqual(driver.calls, 3)
+        self.assertTrue(
+            any("0/2 ready" in (event.get("message") or "") for event in progress)
+        )
+        self.assertNotIn(
+            "driver.execute_async_script",
+            inspect.getsource(engine.load_page_batch),
+        )
+
+    def test_stalled_batch_fails_at_deadline_with_reasons(self):
+        class Driver:
+            def set_script_timeout(self, _value):
+                pass
+
+            def execute_script(self, _script, _page_numbers):
+                return LoadPageBatchTests.status(0, pending_images=3)
+
+        with mock.patch.object(
+            engine.time, "monotonic", side_effect=[0.0, 0.0, 11.0]
+        ), mock.patch.object(engine.time, "sleep", lambda _seconds: None):
+            with self.assertRaisesRegex(
+                RuntimeError, r"after 10s.*2 \(3 image\(s\) still loading\)"
+            ):
+                engine.load_page_batch(Driver(), [1, 2])
+
+    def test_cancellation_is_checked_between_polls(self):
+        event = threading.Event()
+        engine._run_state.cancel_event = event
+
+        class Driver:
+            def set_script_timeout(self, _value):
+                pass
+
+            def execute_script(self, _script, _page_numbers):
+                event.set()
+                return LoadPageBatchTests.status(0, pending_images=1)
+
+        with mock.patch.object(engine.time, "monotonic", lambda: 0.0), \
+            mock.patch.object(engine.time, "sleep", lambda _seconds: None):
+            with self.assertRaises(engine.DownloadCancelledError):
+                engine.load_page_batch(Driver(), [1, 2])
+
+    def test_transient_renderer_timeout_is_retried(self):
+        calls = {"count": 0}
+
+        class Driver:
+            def set_script_timeout(self, _value):
+                pass
+
+            def execute_script(self, _script, _page_numbers):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise engine.WebDriverException(
+                        "timed out receiving message from renderer"
+                    )
+                return LoadPageBatchTests.status(2, total_images=0)
+
+        with mock.patch.object(engine.time, "monotonic", lambda: 0.0), \
+            mock.patch.object(engine.time, "sleep", lambda _seconds: None):
+            engine.load_page_batch(Driver(), [1, 2])
+        self.assertEqual(calls["count"], 2)
+
+    def test_dead_browser_session_fails_immediately(self):
+        class Driver:
+            def set_script_timeout(self, _value):
+                pass
+
+            def execute_script(self, _script, _page_numbers):
+                raise engine.WebDriverException("invalid session id")
+
+        with mock.patch.object(engine.time, "monotonic", lambda: 0.0):
+            with self.assertRaisesRegex(RuntimeError, "Chrome stopped responding"):
+                engine.load_page_batch(Driver(), [1, 2])
+
+
+class CloseDriverTests(unittest.TestCase):
+    def test_normal_quit(self):
+        class Driver:
+            quit_called = False
+
+            def quit(self):
+                self.quit_called = True
+
+        driver = Driver()
+        engine.close_driver(driver)
+        self.assertTrue(driver.quit_called)
+
+    def test_failed_quit_terminates_driver_service(self):
+        class Process:
+            terminated = False
+            waited = False
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout):
+                self.waited = timeout == 5
+
+        process = Process()
+
+        class Driver:
+            service = type("Service", (), {"process": process})()
+
+            def quit(self):
+                raise engine.WebDriverException("chrome not reachable")
+
+        engine.close_driver(Driver())
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
+
 class LoggingAndOptionsTests(unittest.TestCase):
     def test_log_callback_survives_missing_stdout(self):
         lines = []
@@ -208,6 +398,12 @@ class LoggingAndOptionsTests(unittest.TestCase):
         self.assertEqual(
             options.to_capabilities().get("pageLoadStrategy"), "eager"
         )
+
+    def test_cookie_cleanup_does_not_scan_every_dom_node(self):
+        source = inspect.getsource(engine.hide_cookie_dialogs)
+        self.assertNotIn("querySelectorAll('*')", source)
+        self.assertNotIn("element.innerText", source)
+        self.assertIn("overlayCandidates", source)
 
 
 if __name__ == "__main__":

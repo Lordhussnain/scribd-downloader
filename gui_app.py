@@ -69,7 +69,7 @@ except Exception:  # ImportError or a broken native build
     _DND_AVAILABLE = False
 
 APP_NAME = "Scribd Downloader"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 CHROME_DOWNLOAD_URL = "https://www.google.com/chrome/"
 LINK_FILE_EXTENSIONS = {".txt", ".text", ".md", ".csv", ".url", ".html", ".htm"}
 MAX_LINK_FILE_BYTES = 2 * 1024 * 1024
@@ -508,6 +508,151 @@ def friendly_error(error):
     return text or "Something went wrong during the download."
 
 
+def run_download_queue(
+    *,
+    items_provider,
+    engine,
+    settings,
+    folder,
+    policy,
+    events,
+    stop_event,
+    set_current_cancel,
+    cleanup_partial,
+):
+    """Download pending queue items sequentially and always report the end.
+
+    This is intentionally GUI-toolkit-free. The worker thread does not touch
+    widgets; it mutates :class:`QueueItem` state and posts events for the Tk
+    thread. Keeping the loop outside the window class also lets the test
+    suite prove a two-item queue behaves exactly like two single downloads:
+    each item starts only after the previous item's engine call returns.
+
+    Equally important, ``queue_finished`` is emitted from ``finally``. An
+    unexpected error while choosing an item or preparing its output path must
+    never kill the thread silently and leave the GUI in "running" forever.
+    A non-``None`` ``queue_finished`` payload is a traceback for diagnostics.
+    """
+    active_item = None
+    fatal_traceback = ""
+
+    def safe_cleanup(output, existed_before):
+        try:
+            cleanup_partial(output, existed_before)
+        except Exception:
+            pass  # Cleanup must never suppress the item's result event.
+
+    try:
+        while not stop_event.is_set():
+            item = next(
+                (
+                    candidate
+                    for candidate in list(items_provider())
+                    if candidate.status == "pending"
+                ),
+                None,
+            )
+            if item is None:
+                break
+
+            active_item = item
+            # Snapshot the fields the engine needs. The UI locks the active
+            # row's rename/remove controls, but the worker should not depend
+            # on that presentation rule for correctness.
+            source_url = item.source_url
+            filename = item.filename
+            document_id = item.document_id
+
+            item.status = "downloading"
+            item.percent = 0
+            item.activity = "Starting Chrome…"
+            item.detail = ""
+
+            output = Path(folder) / filename
+            existed_before = output.exists()
+            if existed_before and policy == "skip":
+                item.status = "skipped"
+                item.output_path = output
+                events.put(("item_skipped", item))
+                active_item = None
+                continue
+            if existed_before and policy == "copy":
+                output = unique_path(output)
+            item.output_path = output
+
+            cancel_event = threading.Event()
+            set_current_cancel(cancel_event)
+            if stop_event.is_set():
+                cancel_event.set()
+            events.put(("item_started", item))
+
+            try:
+                saved = engine.download_document(
+                    source_url,
+                    str(output),
+                    on_log=lambda line: events.put(("log", line)),
+                    on_progress=lambda info, doc_id=document_id: events.put(
+                        ("progress", (doc_id, info))
+                    ),
+                    cancel_event=cancel_event,
+                    headless=not settings.show_browser,
+                    batch_size=settings.batch_size,
+                    page_load_timeout=settings.page_load_timeout,
+                    cdp_timeout=settings.cdp_timeout,
+                )
+                item.status = "done"
+                item.percent = 100
+                item.activity = ""
+                item.output_path = Path(saved)
+                events.put(("item_done", item))
+            except engine.DownloadCancelledError:
+                item.status = "cancelled"
+                item.activity = ""
+                safe_cleanup(output, existed_before)
+                events.put(("item_cancelled", item))
+            except Exception as error:  # noqa: BLE001 - shown to the user
+                item.status = "failed"
+                item.activity = ""
+                item.detail = friendly_error(error)
+                safe_cleanup(output, existed_before)
+                events.put(
+                    ("item_failed", (item, error, traceback.format_exc()))
+                )
+            finally:
+                set_current_cancel(None)
+                active_item = None
+    except Exception:  # noqa: BLE001 - worker must still finalize the GUI
+        fatal_traceback = traceback.format_exc()
+        if active_item is not None and active_item.status == "downloading":
+            active_item.status = "failed"
+            active_item.activity = ""
+            active_item.detail = (
+                "The download worker stopped unexpectedly. "
+                "See the diagnostic log."
+            )
+            events.put(
+                (
+                    "item_failed",
+                    (
+                        active_item,
+                        RuntimeError("The download worker stopped unexpectedly."),
+                        fatal_traceback,
+                    ),
+                )
+            )
+        else:
+            events.put(
+                (
+                    "log",
+                    "ERROR: The queue worker stopped unexpectedly. "
+                    "See the diagnostic log.",
+                )
+            )
+    finally:
+        set_current_cancel(None)
+        events.put(("queue_finished", fatal_traceback or None))
+
+
 def run_check():
     """Print environment diagnostics (no window). Used after building."""
     print(f"{APP_NAME} {APP_VERSION}")
@@ -740,7 +885,8 @@ if ctk is not None:
                 titles, text=APP_NAME, font=self._font(21, "bold"), anchor="w"
             ).pack(fill="x")
             ctk.CTkLabel(
-                titles, text="Download Scribd documents as clean PDFs",
+                titles,
+                text=f"Download Scribd documents as clean PDFs  ·  v{APP_VERSION}",
                 font=self._font(12), text_color=TEXT_MUTED, anchor="w",
             ).pack(fill="x")
             self.chrome_label = ctk.CTkLabel(
@@ -1510,68 +1656,20 @@ if ctk is not None:
                 widget.configure(state=state)
 
         def _queue_worker(self, folder, policy):
-            """Sequentially download pending items. Data-only thread: every
-            widget change is posted to the main thread via ``self.events``."""
-            settings = self.settings
-            while not self.queue_stop.is_set():
-                item = next(
-                    (i for i in list(self.items) if i.status == "pending"), None
-                )
-                if item is None:
-                    break
-
-                item.status = "downloading"
-                item.percent = 0
-                item.activity = "Starting Chrome…"
-                item.detail = ""
-                output = folder / item.filename
-                existed_before = output.exists()
-                if existed_before and policy == "skip":
-                    item.status = "skipped"
-                    item.output_path = output
-                    self.events.put(("item_skipped", item))
-                    continue
-                if existed_before and policy == "copy":
-                    output = unique_path(output)
-                item.output_path = output
-
-                cancel_event = threading.Event()
-                self.current_cancel = cancel_event
-                doc_id = item.document_id
-                self.events.put(("item_started", item))
-                try:
-                    saved = self.engine.download_document(
-                        item.source_url,
-                        str(output),
-                        on_log=lambda line: self.events.put(("log", line)),
-                        on_progress=lambda info, d=doc_id: self.events.put(
-                            ("progress", (d, info))
-                        ),
-                        cancel_event=cancel_event,
-                        headless=not settings.show_browser,
-                        batch_size=settings.batch_size,
-                        page_load_timeout=settings.page_load_timeout,
-                        cdp_timeout=settings.cdp_timeout,
-                    )
-                    item.status = "done"
-                    item.percent = 100
-                    item.output_path = Path(saved)
-                    self.events.put(("item_done", item))
-                except self.engine.DownloadCancelledError:
-                    item.status = "cancelled"
-                    self._cleanup_partial(output, existed_before)
-                    self.events.put(("item_cancelled", item))
-                except Exception as error:  # noqa: BLE001 - shown to the user
-                    item.status = "failed"
-                    item.detail = friendly_error(error)
-                    self._cleanup_partial(output, existed_before)
-                    self.events.put(
-                        ("item_failed", (item, error, traceback.format_exc()))
-                    )
-                finally:
-                    self.current_cancel = None
-
-            self.events.put(("queue_finished", None))
+            """Run the sequential queue loop on the worker thread."""
+            run_download_queue(
+                items_provider=lambda: self.items,
+                engine=self.engine,
+                settings=self.settings,
+                folder=folder,
+                policy=policy,
+                events=self.events,
+                stop_event=self.queue_stop,
+                set_current_cancel=lambda event: setattr(
+                    self, "current_cancel", event
+                ),
+                cleanup_partial=self._cleanup_partial,
+            )
 
         @staticmethod
         def _cleanup_partial(output, existed_before):
@@ -1682,7 +1780,16 @@ if ctk is not None:
                         if not self.log_visible:
                             self._toggle_log()
                     elif kind == "queue_finished":
-                        self._on_queue_finished()
+                        if payload:
+                            self._write_diagnostic(
+                                "Queue worker stopped unexpectedly:\n"
+                                + str(payload)
+                            )
+                            self._append_log(
+                                "ERROR: The queue worker stopped "
+                                "unexpectedly. See the diagnostic log."
+                            )
+                        self._on_queue_finished(worker_error=bool(payload))
             except queue.Empty:
                 pass
             except Exception:
@@ -1696,7 +1803,7 @@ if ctk is not None:
                 except Exception:
                     pass
 
-        def _on_queue_finished(self):
+        def _on_queue_finished(self, worker_error=False):
             self.running = False
             self._timing_active = False
             self._timing_generation += 1
@@ -1721,14 +1828,30 @@ if ctk is not None:
             remaining = self._pending_count()
             stopped = " (stopped early)" if remaining and self.queue_stop.is_set() else ""
 
-            all_ok = stats["done"] and not (stats["failed"] or stats["cancelled"])
+            all_ok = (
+                stats["done"]
+                and not (stats["failed"] or stats["cancelled"])
+                and not worker_error
+            )
+            title_prefix = (
+                "✓"
+                if all_ok
+                else "Queue stopped unexpectedly"
+                if worker_error
+                else "Queue finished"
+            )
             self.result_title.configure(
-                text=f"{'✓' if all_ok else 'Queue finished'}  "
+                text=f"{title_prefix}  "
                      f"{', '.join(parts)}{stopped}",
                 text_color=SUCCESS if all_ok else TEXT_MAIN,
             )
             detail = f"Saved to {self.folder_var.get()}"
-            if remaining:
+            if worker_error:
+                detail += (
+                    "  ·  The worker error was written to "
+                    f"{diagnostic_log_path()}"
+                )
+            elif remaining:
                 detail += (
                     f"  ·  {remaining} still waiting — press Download "
                     "to continue."
@@ -1750,7 +1873,13 @@ if ctk is not None:
             self.result_panel.pack(fill="x", pady=(0, 14), after=self.action_frame)
             self.progress_card.pack_forget()
             self.progress_card.pack(fill="x", pady=(0, 14), after=self.result_panel)
-            self.status_label.configure(text="Queue finished.")
+            self.status_label.configure(
+                text=(
+                    "Queue stopped unexpectedly."
+                    if worker_error
+                    else "Queue finished."
+                )
+            )
             self._append_log(f"--- Queue finished: {', '.join(parts)} ---")
 
             # Open-when-done only makes sense for a single-document run.
@@ -1796,10 +1925,13 @@ if ctk is not None:
                     # load/export batch transition.
                     self.export_started_at = self.stage_started_at
 
-            if stage == "export" and current is not None and total:
-                activity = f"Exporting page {current} of {total}"
-            elif message:
+            if message:
+                # The engine distinguishes preparing, printing and completed
+                # pages. Prefer that text; ``current`` remains the completed
+                # count used for the percentage.
                 activity = message
+            elif stage == "export" and current is not None and total:
+                activity = f"Exporting page {current} of {total}"
             else:
                 activity = STAGE_LABELS.get(stage, "Downloading…")
             self.last_activity = activity
