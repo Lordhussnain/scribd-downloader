@@ -8,6 +8,7 @@ import importlib.util
 import sys
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ENGINE_PATH = Path(__file__).resolve().parent.parent / "scribd-downloader.py"
@@ -124,6 +125,89 @@ class DownloadDocumentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             engine.download_document("bad", on_log=lambda _line: None)
         self.assertIsNone(getattr(engine._run_state, "on_log", None))
+
+
+class WaitForDocumentPagesTests(unittest.TestCase):
+    def test_returns_immediately_when_doc_manager_count_matches(self):
+        class Driver:
+            def execute_script(self, _script):
+                return {
+                    "outerPages": 12,
+                    "managerPages": 12,
+                    "readyState": "interactive",
+                    "title": "Doc",
+                }
+
+        self.assertEqual(engine.wait_for_document_pages(Driver(), 10), 12)
+
+    def test_waits_for_stable_outer_page_count(self):
+        snapshots = iter(
+            [
+                {"outerPages": 2, "managerPages": 0},
+                {"outerPages": 4, "managerPages": 0},
+                {"outerPages": 4, "managerPages": 0},
+                {"outerPages": 4, "managerPages": 0},
+            ]
+        )
+
+        class Driver:
+            def execute_script(self, _script):
+                return next(snapshots)
+
+        with mock.patch.object(engine.time, "sleep", lambda _seconds: None):
+            self.assertEqual(engine.wait_for_document_pages(Driver(), 10), 4)
+
+    def test_transient_navigation_errors_are_retried(self):
+        calls = {"count": 0}
+
+        class Driver:
+            def execute_script(self, _script):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise engine.WebDriverException("execution context destroyed")
+                return {
+                    "outerPages": 5,
+                    "managerPages": 5,
+                    "readyState": "interactive",
+                    "title": "Doc",
+                }
+
+        with mock.patch.object(engine.time, "sleep", lambda _seconds: None):
+            self.assertEqual(engine.wait_for_document_pages(Driver(), 10), 5)
+
+    def test_cancellation_is_honoured_while_waiting(self):
+        event = threading.Event()
+        engine._run_state.cancel_event = event
+
+        class Driver:
+            def execute_script(self, _script):
+                event.set()
+                return {"outerPages": 0, "managerPages": 0}
+
+        try:
+            with mock.patch.object(engine.time, "sleep", lambda _seconds: None):
+                with self.assertRaises(engine.DownloadCancelledError):
+                    engine.wait_for_document_pages(Driver(), 10)
+        finally:
+            engine._run_state.cancel_event = None
+
+
+class LoggingAndOptionsTests(unittest.TestCase):
+    def test_log_callback_survives_missing_stdout(self):
+        lines = []
+        engine._run_state.on_log = lines.append
+        try:
+            with mock.patch.object(sys, "stdout", None):
+                engine._log("still delivered")
+        finally:
+            engine._run_state.on_log = None
+        self.assertEqual(lines, ["still delivered"])
+
+    def test_chrome_uses_eager_page_load_strategy(self):
+        options = engine.build_chrome_options("/tmp/profile")
+        self.assertEqual(
+            options.to_capabilities().get("pageLoadStrategy"), "eager"
+        )
 
 
 if __name__ == "__main__":

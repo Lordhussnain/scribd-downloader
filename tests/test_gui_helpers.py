@@ -4,6 +4,7 @@ These exercise pure logic (no window is opened), so they run headless:
     python -m unittest discover -s tests -v
 """
 
+import json
 import sys
 import tempfile
 import unittest
@@ -123,6 +124,80 @@ class SettingsTests(unittest.TestCase):
                 gui_app.config_dir = original
         self.assertEqual(loaded.conflict_policy, "skip")
         self.assertEqual(loaded.pending_queue[0]["filename"], "A.pdf")
+
+
+class SettingsPersistenceRegressionTests(unittest.TestCase):
+    def test_timeout_validation(self):
+        self.assertEqual(
+            gui_app.validate_timeout_values(" 120 ", "600"), (120, 600)
+        )
+        for page, export in (("x", "600"), ("9", "600"), ("120", "3601")):
+            with self.assertRaises(ValueError):
+                gui_app.validate_timeout_values(page, export)
+
+    def test_load_normalizes_invalid_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "settings.json").write_text(
+                json.dumps(
+                    {
+                        "appearance": "Purple",
+                        "batch_size": 999,
+                        "page_load_timeout": 1,
+                        "cdp_timeout": "900",
+                        "conflict_policy": "explode",
+                        "show_browser": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            original = gui_app.config_dir
+            gui_app.config_dir = lambda: Path(tmp)
+            try:
+                loaded = gui_app.AppSettings.load()
+            finally:
+                gui_app.config_dir = original
+        self.assertEqual(loaded.appearance, "System")
+        self.assertEqual(loaded.batch_size, 16)
+        self.assertEqual(loaded.page_load_timeout, 10)
+        self.assertEqual(loaded.cdp_timeout, 900)
+        self.assertEqual(loaded.conflict_policy, "copy")
+        self.assertTrue(loaded.show_browser)
+
+    def test_save_reports_success_and_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original = gui_app.config_dir
+            try:
+                gui_app.config_dir = lambda: Path(tmp)
+                self.assertTrue(gui_app.AppSettings().save())
+                blocker = Path(tmp, "not-a-directory")
+                blocker.write_text("x", encoding="utf-8")
+                gui_app.config_dir = lambda: blocker
+                self.assertFalse(gui_app.AppSettings().save())
+            finally:
+                gui_app.config_dir = original
+
+
+class QueueTextRegressionTests(unittest.TestCase):
+    def test_title_counts_downloading_separately(self):
+        items = [
+            gui_app.QueueItem("u1", "1", "A", "A.pdf", status="downloading"),
+            gui_app.QueueItem("u2", "2", "B", "B.pdf", status="pending"),
+            gui_app.QueueItem("u3", "3", "C", "C.pdf", status="done"),
+        ]
+        self.assertEqual(
+            gui_app.queue_title_text(items),
+            "Queue  (3)  ·  downloading  ·  1 waiting  ·  1 saved",
+        )
+
+    def test_downloading_subtext_shows_live_activity(self):
+        item = gui_app.QueueItem(
+            "u", "1", "Doc", "Doc.pdf",
+            status="downloading", activity="Opening document…",
+        )
+        self.assertEqual(
+            gui_app.queue_item_subtext(item),
+            "Opening document…  ·  Doc.pdf",
+        )
 
 
 if __name__ == "__main__":

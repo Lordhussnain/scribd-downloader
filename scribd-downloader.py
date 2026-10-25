@@ -17,6 +17,7 @@ Key behaviors:
 import base64
 import os
 import re
+import socket
 import tempfile
 import threading
 import time
@@ -24,7 +25,7 @@ from io import BytesIO
 from urllib.parse import unquote, urlparse
 
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 
 
@@ -74,7 +75,12 @@ _run_state = threading.local()
 def _log(message=""):
     """Print a message (CLI behaviour) and mirror it to the log callback."""
     text = str(message)
-    print(text)
+    try:
+        # A windowed PyInstaller build may have no stdout at all. Losing the
+        # console copy must never interrupt a GUI download or its callback.
+        print(text, flush=True)
+    except Exception:
+        pass
     callback = getattr(_run_state, "on_log", None)
     if callback is not None:
         try:
@@ -127,6 +133,11 @@ def build_chrome_options(runtime_profile_dir, headless=None):
 
     if HEADLESS_ENABLED if headless is None else headless:
         options.add_argument("--headless=new")
+
+    # Scribd embeds keep loading ads/trackers long after the document DOM is
+    # usable. "eager" returns at DOMContentLoaded; download_document then
+    # explicitly waits for stable Scribd page nodes with a bounded timeout.
+    options.page_load_strategy = "eager"
 
     options.add_argument("--window-size=1600,2200")
     options.add_argument("--no-sandbox")
@@ -1131,9 +1142,19 @@ def save_pdf_pages_individually(
                     f"  Loading page batch "
                     f"{index + 1}-{batch_end}/{page_count}..."
                 )
+                _progress(
+                    "load",
+                    index,
+                    page_count,
+                    f"Loading pages {index + 1}-{batch_end} of {page_count}…",
+                )
                 load_page_batch(
                     driver,
                     batch_page_numbers,
+                )
+                _log(
+                    f"  Loaded page batch "
+                    f"{index + 1}-{batch_end}/{page_count}."
                 )
 
             page_info = driver.execute_script(
@@ -1432,6 +1453,87 @@ def save_pdf_pages_individually(
 
     return os.path.abspath(filename)
 
+def wait_for_document_pages(driver, timeout_seconds):
+    """Wait until Scribd page containers exist and their count is stable.
+
+    Returns the page count. Raises a clear ``RuntimeError`` instead of
+    leaving callers sitting at an unexplained 0% when Scribd serves a bot
+    check, a removed document, or a page that never renders.
+    """
+    timeout_seconds = max(10, int(timeout_seconds))
+    deadline = time.monotonic() + timeout_seconds
+    started_at = time.monotonic()
+    last_count = -1
+    stable_polls = 0
+    last_snapshot = {}
+
+    while time.monotonic() < deadline:
+        _check_cancelled()
+        try:
+            snapshot = driver.execute_script(
+                """
+                const managerPages = window.docManager && window.docManager.pages
+                    ? Object.values(window.docManager.pages).filter(Boolean).length
+                    : 0;
+                return {
+                    outerPages: document.querySelectorAll('.outer_page').length,
+                    managerPages,
+                    readyState: document.readyState,
+                    title: document.title || ''
+                };
+                """
+            ) or {}
+        except WebDriverException:
+            # DOMContentLoaded/eager loading can briefly leave the page
+            # between execution contexts while Scribd finishes routing.
+            snapshot = {}
+        last_snapshot = snapshot
+
+        try:
+            count = int(snapshot.get("outerPages") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        try:
+            manager_count = int(snapshot.get("managerPages") or 0)
+        except (TypeError, ValueError):
+            manager_count = 0
+
+        if count > 0 and count == last_count:
+            stable_polls += 1
+        elif count > 0:
+            stable_polls = 0
+            last_count = count
+        else:
+            stable_polls = 0
+            last_count = count
+
+        # Two identical polls (~1 second) are enough for the initial DOM;
+        # if docManager already agrees, one stable poll is sufficient.
+        if count > 0 and (stable_polls >= 2 or manager_count == count):
+            return count
+
+        _progress(
+            "load",
+            message=(
+                "Waiting for Scribd to render the document pages… "
+                f"({int(time.monotonic() - started_at)}s)"
+            ),
+        )
+        time.sleep(0.5)
+
+    title = str(last_snapshot.get("title") or "").strip()
+    ready_state = str(last_snapshot.get("readyState") or "unknown")
+    suffix = f" Page title: {title}." if title else ""
+    raise RuntimeError(
+        "Timed out after "
+        f"{timeout_seconds}s waiting for Scribd pages to appear "
+        f"(browser readyState: {ready_state}).{suffix} "
+        "The document may be blocked by a browser check, removed, private, "
+        "or the connection is too slow. Enable “Show Chrome window” in "
+        "Settings to see what Scribd is displaying."
+    )
+
+
 def download_document(
     url,
     output_path=None,
@@ -1492,9 +1594,12 @@ def download_document(
     _run_state.on_progress = on_progress
     _run_state.cancel_event = cancel_event
     _run_state.batch_size = batch_size
-    _run_state.page_load_timeout = (
-        None if page_load_timeout is None else max(10, int(page_load_timeout))
+    effective_page_load_timeout = (
+        DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS
+        if page_load_timeout is None
+        else max(10, int(page_load_timeout))
     )
+    _run_state.page_load_timeout = effective_page_load_timeout
     effective_cdp_timeout = (
         DEFAULT_CDP_TIMEOUT_SECONDS
         if cdp_timeout is None
@@ -1517,29 +1622,53 @@ def download_document(
                 options = build_chrome_options(
                     runtime_profile_dir, headless=headless
                 )
-                driver = webdriver.Chrome(options=options)
+                _log(
+                    "Launching ChromeDriver/Chrome (the first launch can "
+                    "take a while if ChromeDriver needs downloading)..."
+                )
+                # Selenium captures socket.getdefaulttimeout() when its HTTP
+                # client is created. Give session creation the same finite
+                # ceiling as later CDP commands instead of allowing a
+                # network/driver hiccup to block this worker forever.
+                previous_socket_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(effective_cdp_timeout)
+                try:
+                    driver = webdriver.Chrome(options=options)
+                finally:
+                    socket.setdefaulttimeout(previous_socket_timeout)
+                _log("Chrome started.")
+
+                configure_command_timeout(driver, effective_cdp_timeout)
+                driver.set_page_load_timeout(effective_page_load_timeout)
+                driver.set_script_timeout(effective_page_load_timeout + 10)
 
                 _check_cancelled()
-                _progress("connect", message="Opening document...")
-                driver.get(converted_url)
-                time.sleep(1)
+                _progress("connect", message="Opening document…")
+                try:
+                    driver.get(converted_url)
+                except TimeoutException:
+                    # The DOM often becomes usable even when a tracker or ad
+                    # request makes Selenium's navigation wait time out.
+                    _log(
+                        "Browser navigation timed out; checking whether "
+                        "the document rendered anyway..."
+                    )
+                    try:
+                        driver.execute_script("window.stop();")
+                    except WebDriverException:
+                        pass
+
+                _check_cancelled()
+                _progress(
+                    "load",
+                    message="Waiting for Scribd to render the document pages…",
+                )
+                total_pages = wait_for_document_pages(
+                    driver, effective_page_load_timeout
+                )
 
                 hide_cookie_dialogs(driver)
                 _log("Cookie dialogs hidden.")
-
-                _progress("load", message="Detecting pages...")
-                total_pages = driver.execute_script(
-                    """
-                    return document.querySelectorAll('.outer_page').length;
-                    """
-                )
-
-                if total_pages == 0:
-                    raise RuntimeError(
-                        "No printable document pages were detected. "
-                        "The document may be private, removed, or "
-                        "protected."
-                    )
 
                 _log(f"Detected {total_pages} pages.")
                 _progress(

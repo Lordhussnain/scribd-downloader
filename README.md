@@ -113,7 +113,7 @@ What you get:
 - **Live progress** — Connect → Load → Export → Merge step indicator, per-page progress bar, elapsed/ETA, and a collapsible activity log you can copy when reporting issues
 - **Cancel safely** — stops between pages and discards incomplete output
 - **Recent downloads** — reopen or reveal the last 5 PDFs in one click
-- **Settings dialog** — appearance (System/Light/Dark), pages-per-batch, timeouts, show-browser troubleshooting mode, open-when-done; saved to `%APPDATA%\ScribdDownloader\settings.json`
+- **Settings dialog** — appearance (System/Light/Dark), pages-per-batch, timeouts, show-browser troubleshooting mode, open-when-done. Changes save automatically (including when closing with the X) with a visible “Saved ✓” confirmation, to `%APPDATA%\ScribdDownloader\settings.json`; download-setting changes apply from the next document
 - **Diagnostics** — `python gui_app.py --check` (or `ScribdDownloader.exe --check`) verifies the engine, dependencies, and Chrome detection without opening a window
 
 ---
@@ -224,6 +224,14 @@ An unsigned, locally built `.exe` may trigger SmartScreen. Choose **More info �
 
 ### GUI: “Chrome not found” in the header
 Install [Google Chrome](https://www.google.com/chrome/), then restart the app. To reset all GUI settings, delete `%APPDATA%\ScribdDownloader\settings.json`.
+
+### GUI: A download appears to stay at 0%
+The percentage only advances during the **Export PDF** stage. While Chrome is starting, Scribd is rendering, or a batch of pages/images is loading, the queue row and progress card show the current activity with a live elapsed timer (for example, “Waiting for Scribd to render the document pages… · 35s”) and an animated bar. Page detection is bounded by **Settings → Page load timeout** (default 120 seconds); after that the row fails with a specific message instead of hanging indefinitely.
+
+If it repeatedly times out, open **Settings**, enable **Show Chrome window while downloading** (it saves immediately), then retry the document. The visible Chrome window will show whether Scribd presented a browser check, login/protection page, or another block. Full diagnostics are continuously written to `%APPDATA%\ScribdDownloader\diagnostic.log` — include the relevant section when reporting an issue.
+
+### GUI: Settings do not seem to save
+Settings are saved as soon as each control changes; the footer must say **Saved ✓** with a time. Timeout fields save when they lose focus or when you press Done/X, and invalid values are highlighted instead of being silently discarded. If the footer reports that the file could not be saved, check permissions for `%APPDATA%\ScribdDownloader\settings.json`. Note that changing batch/timeout/browser visibility does not alter a Chrome session that is already running — it applies from the next document.
 
 ### "ChromeDriver not found" error
 The script uses Selenium Manager to auto-download ChromeDriver. If you face issues:

@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -68,7 +69,7 @@ except Exception:  # ImportError or a broken native build
     _DND_AVAILABLE = False
 
 APP_NAME = "Scribd Downloader"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 CHROME_DOWNLOAD_URL = "https://www.google.com/chrome/"
 LINK_FILE_EXTENSIONS = {".txt", ".text", ".md", ".csv", ".url", ".html", ".htm"}
 MAX_LINK_FILE_BYTES = 2 * 1024 * 1024
@@ -137,6 +138,38 @@ def config_dir():
     return Path(base) / "ScribdDownloader"
 
 
+def settings_path():
+    return config_dir() / "settings.json"
+
+
+def diagnostic_log_path():
+    return config_dir() / "diagnostic.log"
+
+
+def _normalized_int(value, default, minimum, maximum):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
+def validate_timeout_values(page_text, export_text):
+    """Return ``(page, export)`` or raise ValueError with a friendly text."""
+    try:
+        page_value = int(str(page_text).strip())
+        export_value = int(str(export_text).strip())
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Timeouts must be whole numbers (page: 10–600, export: 30–3600)."
+        ) from None
+    if not (10 <= page_value <= 600 and 30 <= export_value <= 3600):
+        raise ValueError(
+            "Timeouts must be whole numbers (page: 10–600, export: 30–3600)."
+        )
+    return page_value, export_value
+
+
 def default_downloads_dir():
     downloads = Path.home() / "Downloads"
     return str(downloads if downloads.is_dir() else Path.home())
@@ -158,24 +191,57 @@ class AppSettings:
 
     @classmethod
     def load(cls):
-        path = config_dir() / "settings.json"
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(settings_path().read_text(encoding="utf-8"))
             known = {name for name in cls.__dataclass_fields__}
-            return cls(**{k: v for k, v in data.items() if k in known})
+            settings = cls(**{k: v for k, v in data.items() if k in known})
         except (OSError, ValueError, TypeError):
-            return cls()
+            settings = cls()
+
+        # A hand-edited or older settings file must not make the GUI look
+        # as though valid edits "do not work". Coerce every field into the
+        # ranges the Settings dialog itself accepts.
+        if settings.appearance not in ("System", "Light", "Dark"):
+            settings.appearance = "System"
+        settings.batch_size = min(
+            (4, 8, 16),
+            key=lambda option: abs(
+                option - _normalized_int(settings.batch_size, 8, 1, 64)
+            ),
+        )
+        settings.page_load_timeout = _normalized_int(
+            settings.page_load_timeout, 120, 10, 600
+        )
+        settings.cdp_timeout = _normalized_int(
+            settings.cdp_timeout, 600, 30, 3600
+        )
+        settings.show_browser = bool(settings.show_browser)
+        settings.open_when_done = bool(settings.open_when_done)
+        settings.clipboard_check = bool(settings.clipboard_check)
+        if settings.conflict_policy not in ("copy", "skip", "overwrite"):
+            settings.conflict_policy = "copy"
+        if not isinstance(settings.output_dir, str) or not settings.output_dir:
+            settings.output_dir = default_downloads_dir()
+        if not isinstance(settings.recents, list):
+            settings.recents = []
+        if not isinstance(settings.pending_queue, list):
+            settings.pending_queue = []
+        return settings
 
     def save(self):
+        """Persist settings. Returns True on success (never raises)."""
         try:
             folder = config_dir()
             folder.mkdir(parents=True, exist_ok=True)
-            target = folder / "settings.json"
+            target = settings_path()
             tmp = target.with_suffix(".tmp")
             tmp.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
             tmp.replace(target)
-        except OSError:
-            pass  # Settings are a convenience; never crash over them.
+            return True
+        except Exception:
+            # Callers that care (the Settings dialog) inspect the return
+            # value and tell the user; background saves stay non-fatal.
+            return False
 
     def add_recent(self, path, title):
         self.recents = [r for r in self.recents if r.get("path") != str(path)]
@@ -200,6 +266,7 @@ class QueueItem:
     status: str = "pending"  # pending|downloading|done|failed|cancelled|skipped
     output_path: object = None  # Path once known
     percent: int = 0
+    activity: str = ""  # current stage text while downloading
     detail: str = ""  # friendly error / note shown under the title
 
     @classmethod
@@ -210,6 +277,41 @@ class QueueItem:
             title=info["title"] or f"Scribd document {info['document_id']}",
             filename=info["filename"],
         )
+
+
+def queue_item_subtext(item):
+    """Secondary queue-row text, including live activity while downloading."""
+    if item.status == "failed" and item.detail:
+        return item.detail
+    if item.status == "downloading":
+        activity = item.activity or "Downloading…"
+        return f"{activity}  ·  {item.filename}"
+    if item.status == "skipped":
+        return f"{item.filename}  ·  skipped (file already exists)"
+    if item.status == "done" and item.output_path:
+        try:
+            size = human_size(Path(item.output_path).stat().st_size)
+            return f"{Path(item.output_path).name}  ·  {size}"
+        except OSError:
+            pass
+    return f"{item.filename}  ·  ID {item.document_id}"
+
+
+def queue_title_text(items):
+    """Queue card heading with accurate active/waiting/saved counts."""
+    pending = sum(1 for item in items if item.status == "pending")
+    active = sum(1 for item in items if item.status == "downloading")
+    done = sum(1 for item in items if item.status == "done")
+    parts = []
+    if active:
+        parts.append("downloading")
+    if pending:
+        parts.append(f"{pending} waiting")
+    if done:
+        parts.append(f"{done} saved")
+    return f"Queue  ({len(items)})" + (
+        "  ·  " + "  ·  ".join(parts) if parts else ""
+    )
 
 
 def dedupe_infos(infos, known_ids=None):
@@ -431,7 +533,8 @@ def run_check():
         return 1
     chrome = find_chrome()
     print(f"Chrome       : {chrome or 'not detected (Selenium may still find it)'}")
-    print(f"Settings     : {config_dir() / 'settings.json'}")
+    print(f"Settings     : {settings_path()}")
+    print(f"Diagnostics  : {diagnostic_log_path()}")
     return 0
 
 
@@ -473,8 +576,12 @@ if ctk is not None:
             self.settings = settings
 
             self.title(APP_NAME)
-            self.geometry("940x860")
-            self.minsize(820, 720)
+            screen_width = self.winfo_screenwidth()
+            screen_height = self.winfo_screenheight()
+            window_width = min(940, max(760, screen_width - 40))
+            window_height = min(860, max(620, screen_height - 80))
+            self.geometry(f"{window_width}x{window_height}")
+            self.minsize(760, 600)
             self.configure(fg_color=WINDOW_BG)
             self._set_window_icon()
             self._center_on_screen()
@@ -493,7 +600,12 @@ if ctk is not None:
             self.parsed = None  # parse of the URL entry (single-link preview)
             self.started_at = None
             self.export_started_at = None
+            self.stage_started_at = None
             self.last_progress = {}
+            self.last_activity = ""
+            self._timing_active = False
+            self._timing_generation = 0
+            self._settings_dialog = None
             self._last_clipboard = None
             self._validate_job = None
             self.log_visible = False
@@ -562,8 +674,11 @@ if ctk is not None:
 
         # ---------------------------------------------------------- layout
         def _build_ui(self):
-            outer = ctk.CTkFrame(self, fg_color="transparent")
-            outer.pack(fill="both", expand=True, padx=28, pady=(20, 14))
+            outer = ctk.CTkScrollableFrame(
+                self, fg_color="transparent",
+                scrollbar_button_color=FIELD_BORDER,
+            )
+            outer.pack(fill="both", expand=True, padx=18, pady=(14, 8))
             self.outer = outer
 
             self._build_header(outer)
@@ -637,14 +752,14 @@ if ctk is not None:
                 lambda _e: None if find_chrome() else webbrowser.open(CHROME_DOWNLOAD_URL),
             )
 
-            appearance = ctk.CTkOptionMenu(
+            self.appearance_menu = ctk.CTkOptionMenu(
                 header, values=["System", "Light", "Dark"], width=104, height=32,
                 font=self._font(12), fg_color=CARD_BG, button_color=FIELD_BORDER,
                 button_hover_color=ACCENT, text_color=TEXT_MAIN,
                 command=self._on_appearance_change,
             )
-            appearance.set(self.settings.appearance)
-            appearance.pack(side="right")
+            self.appearance_menu.set(self.settings.appearance)
+            self.appearance_menu.pack(side="right")
             self._ghost_button(header, "Settings", 92, self._open_settings, height=32).pack(
                 side="right", padx=(0, 8)
             )
@@ -726,7 +841,7 @@ if ctk is not None:
             self.import_btn.pack(side="right", padx=(0, 8))
 
             self.queue_list = ctk.CTkScrollableFrame(
-                inner, height=176, fg_color="transparent",
+                inner, height=150, fg_color="transparent",
                 scrollbar_button_color=FIELD_BORDER,
             )
             self.queue_list.pack(fill="x")
@@ -988,8 +1103,19 @@ if ctk is not None:
 
         def _on_appearance_change(self, value):
             self.settings.appearance = value
-            self.settings.save()
+            saved = self.settings.save()
             ctk.set_appearance_mode(value)
+            menu = getattr(self, "appearance_menu", None)
+            if menu is not None:
+                try:
+                    menu.set(value)
+                except Exception:
+                    pass
+            if not saved:
+                self._write_diagnostic(
+                    f"Appearance setting could not be saved: {settings_path()}"
+                )
+            return saved
 
         def _on_policy_change(self, label):
             self.settings.conflict_policy = CONFLICT_POLICIES.get(label, "copy")
@@ -1150,31 +1276,14 @@ if ctk is not None:
 
         # ---------------------------------------------------------- queue UI
         def _item_subtext(self, item):
-            if item.status == "failed" and item.detail:
-                return item.detail
-            if item.status == "skipped":
-                return f"{item.filename}  ·  skipped (file already exists)"
-            if item.status == "done" and item.output_path:
-                try:
-                    size = human_size(Path(item.output_path).stat().st_size)
-                    return f"{Path(item.output_path).name}  ·  {size}"
-                except OSError:
-                    pass
-            return f"{item.filename}  ·  ID {item.document_id}"
+            return queue_item_subtext(item)
 
         def _refresh_queue(self):
             """Rebuild queue rows from the model (not called on progress ticks)."""
             for child in self.queue_list.winfo_children():
                 child.destroy()
             self.row_refs = {}
-
-            pending = sum(1 for i in self.items if i.status == "pending")
-            done = sum(1 for i in self.items if i.status == "done")
-            self.queue_title.configure(
-                text=f"Queue  ({len(self.items)})"
-                     + (f"  ·  {pending} waiting" if pending else "")
-                     + (f"  ·  {done} saved" if done else "")
-            )
+            self.queue_title.configure(text=queue_title_text(self.items))
 
             if not self.items:
                 empty_text = "No documents queued yet.\nPaste Scribd links above"
@@ -1413,6 +1522,7 @@ if ctk is not None:
 
                 item.status = "downloading"
                 item.percent = 0
+                item.activity = "Starting Chrome…"
                 item.detail = ""
                 output = folder / item.filename
                 existed_before = output.exists()
@@ -1455,7 +1565,9 @@ if ctk is not None:
                     item.status = "failed"
                     item.detail = friendly_error(error)
                     self._cleanup_partial(output, existed_before)
-                    self.events.put(("item_failed", (item, error)))
+                    self.events.put(
+                        ("item_failed", (item, error, traceback.format_exc()))
+                    )
                 finally:
                     self.current_cancel = None
 
@@ -1490,6 +1602,13 @@ if ctk is not None:
 
         # ---------------------------------------------------------- worker events
         def _poll_events(self):
+            """Drain worker events on the Tk thread.
+
+            This callback must be self-healing: if one widget update fails,
+            it is written to the diagnostic log and polling is rescheduled.
+            Previously an exception before the final ``after`` call could
+            leave the worker running while the UI looked permanently stuck.
+            """
             try:
                 while True:
                     kind, payload = self.events.get_nowait()
@@ -1502,37 +1621,62 @@ if ctk is not None:
                     elif kind == "item_started":
                         self.current_item = payload
                         self.started_at = time.monotonic()
+                        self.stage_started_at = self.started_at
                         self.export_started_at = None
-                        self.last_progress = {}
-                        index = self.items.index(payload) + 1 if payload in self.items else 1
+                        self.last_progress = {
+                            "stage": "connect",
+                            "message": "Starting Chrome…",
+                        }
+                        self.last_activity = "Starting Chrome…"
+                        index = next(
+                            (i + 1 for i, item in enumerate(self.items)
+                             if item is payload),
+                            1,
+                        )
                         self.overall_label.configure(
                             text=f"Document {index} of {len(self.items)} — {payload.title}"
                         )
                         self._reset_steps()
-                        self.progress_bar.set(0)
-                        self._update_row(payload)
-                        self._tick_timing()
+                        self._mark_stage("connect")
+                        self.progress_bar.configure(mode="indeterminate")
+                        self.progress_bar.start()
+                        self.status_label.configure(text=self.last_activity)
+                        # Rebuild rows so the heading changes to
+                        # "1 downloading · n waiting" and the active row no
+                        # longer exposes Edit/remove controls.
+                        self._refresh_queue()
+                        self._start_timing()
                     elif kind == "item_done":
                         self.run_stats["done"] += 1
                         self.last_saved_path = payload.output_path
+                        payload.activity = ""
                         self.settings.add_recent(payload.output_path, payload.title)
                         self._refresh_recents()
                         self._refresh_queue()
                         self._persist_pending()
                     elif kind == "item_skipped":
                         self.run_stats["skipped"] += 1
+                        payload.activity = ""
                         self._append_log(f"Skipped (already exists): {payload.filename}")
                         self._refresh_queue()
                         self._persist_pending()
                     elif kind == "item_cancelled":
                         self.run_stats["cancelled"] += 1
+                        payload.activity = ""
                         self._append_log(f"Cancelled: {payload.title}")
                         self._refresh_queue()
                         self._persist_pending()
                     elif kind == "item_failed":
-                        item, error = payload
+                        if len(payload) == 3:
+                            item, error, error_traceback = payload
+                        else:  # backwards-compatible event shape
+                            item, error = payload
+                            error_traceback = ""
                         self.run_stats["failed"] += 1
+                        item.activity = ""
                         self._append_log(f"ERROR ({item.title}): {error}")
+                        if error_traceback:
+                            self._write_diagnostic(error_traceback)
                         self._refresh_queue()
                         self._persist_pending()
                         if not self.log_visible:
@@ -1541,10 +1685,21 @@ if ctk is not None:
                         self._on_queue_finished()
             except queue.Empty:
                 pass
-            self.after(80, self._poll_events)
+            except Exception:
+                self._write_diagnostic(
+                    "Unhandled error while processing a download event:\n"
+                    + traceback.format_exc()
+                )
+            finally:
+                try:
+                    self.after(80, self._poll_events)
+                except Exception:
+                    pass
 
         def _on_queue_finished(self):
             self.running = False
+            self._timing_active = False
+            self._timing_generation += 1
             self.current_item = None
             self.progress_bar.stop()
             self.stop_btn.configure(state="normal", text="Stop queue")
@@ -1572,12 +1727,23 @@ if ctk is not None:
                      f"{', '.join(parts)}{stopped}",
                 text_color=SUCCESS if all_ok else TEXT_MAIN,
             )
-            self.result_detail.configure(
-                text=f"Saved to {self.folder_var.get()}"
-                     + (f"  ·  {remaining} still waiting — press Download to continue."
-                        if remaining else
-                        "  ·  Open any PDF from its queue row or Recent downloads.")
-            )
+            detail = f"Saved to {self.folder_var.get()}"
+            if remaining:
+                detail += (
+                    f"  ·  {remaining} still waiting — press Download "
+                    "to continue."
+                )
+            elif stats["failed"]:
+                detail += (
+                    "  ·  See the failed row and activity log; full "
+                    f"diagnostics: {diagnostic_log_path()}"
+                )
+            else:
+                detail += (
+                    "  ·  Open any PDF from its queue row or "
+                    "Recent downloads."
+                )
+            self.result_detail.configure(text=detail)
             self.open_last_btn.configure(
                 state="normal" if self.last_saved_path else "disabled"
             )
@@ -1617,14 +1783,36 @@ if ctk is not None:
                     label.configure(text_color=TEXT_MUTED, font=self._font(12))
 
         def _apply_progress(self, doc_id, info):
+            previous_stage = self.last_progress.get("stage")
             self.last_progress = info
             stage = info.get("stage") or "export"
             current, total = info.get("current"), info.get("total")
             message = info.get("message") or ""
 
-            if self.current_item is not None and self.current_item.document_id == doc_id:
+            if stage != previous_stage:
+                self.stage_started_at = time.monotonic()
+                if stage == "export" and self.export_started_at is None:
+                    # ETA is based on the whole export, not reset at each
+                    # load/export batch transition.
+                    self.export_started_at = self.stage_started_at
+
+            if stage == "export" and current is not None and total:
+                activity = f"Exporting page {current} of {total}"
+            elif message:
+                activity = message
+            else:
+                activity = STAGE_LABELS.get(stage, "Downloading…")
+            self.last_activity = activity
+
+            if (
+                self.current_item is not None
+                and self.current_item.document_id == doc_id
+            ):
+                self.current_item.activity = activity
                 if stage == "export" and total:
-                    self.current_item.percent = int(round(100 * (current or 0) / total))
+                    self.current_item.percent = int(
+                        round(100 * (current or 0) / total)
+                    )
                 elif stage == "done":
                     self.current_item.percent = 100
                 self._update_row(self.current_item)
@@ -1633,10 +1821,11 @@ if ctk is not None:
                 self._mark_stage(stage)
             elif stage == "done":
                 self._mark_stage("done")
-            if stage == "export" and self.export_started_at is None:
-                self.export_started_at = time.monotonic()
 
-            if stage in ("connect", "merge") or not total:
+            if stage in ("connect", "load", "merge") or not total:
+                # Percentage is only meaningful during page export. During
+                # browser start, rendering and batch loading, an animated
+                # bar + live elapsed activity is clearer than sitting at 0%.
                 self.progress_bar.configure(mode="indeterminate")
                 self.progress_bar.start()
             else:
@@ -1644,35 +1833,101 @@ if ctk is not None:
                 self.progress_bar.configure(mode="determinate")
                 self.progress_bar.set((current or 0) / total if total else 0)
 
-            if stage == "export" and current is not None and total:
-                percent = int(round(100 * current / total))
-                self.status_label.configure(
-                    text=f"Exporting page {current} of {total}  ·  {percent}%"
-                )
-            elif message:
-                self.status_label.configure(text=message)
+            self.status_label.configure(text=activity)
 
-        def _tick_timing(self):
-            if not self.running:
+        def _start_timing(self):
+            if self._timing_active:
                 return
-            elapsed = time.monotonic() - (self.started_at or time.monotonic())
-            text = f"This document: {format_duration(elapsed)}"
-            info = self.last_progress
-            current, total = info.get("current"), info.get("total")
-            if (
-                info.get("stage") == "export"
-                and current
-                and total
-                and current < total
-                and self.export_started_at
-            ):
-                per_page = (time.monotonic() - self.export_started_at) / current
-                text += f"  ·  about {format_duration(per_page * (total - current))} left"
-            self.timing_label.configure(text=text)
-            self.after(500, self._tick_timing)
+            self._timing_active = True
+            self._timing_generation += 1
+            self._tick_timing(self._timing_generation)
+
+        def _tick_timing(self, generation=None):
+            if generation is None:
+                generation = self._timing_generation
+            if not self.running or generation != self._timing_generation:
+                if generation == self._timing_generation:
+                    self._timing_active = False
+                return
+            try:
+                elapsed = time.monotonic() - (self.started_at or time.monotonic())
+                text = f"This document: {format_duration(elapsed)}"
+                info = self.last_progress
+                current, total = info.get("current"), info.get("total")
+                if (
+                    info.get("stage") == "export"
+                    and current
+                    and total
+                    and current < total
+                    and self.export_started_at
+                ):
+                    per_page = (
+                        time.monotonic() - self.export_started_at
+                    ) / current
+                    text += (
+                        "  ·  about "
+                        f"{format_duration(per_page * (total - current))} left"
+                    )
+                self.timing_label.configure(text=text)
+
+                # Heartbeat in both the progress card and queue row: users
+                # can distinguish slow-but-alive from a dead UI at a glance.
+                stage_elapsed = format_duration(
+                    time.monotonic()
+                    - (self.stage_started_at or time.monotonic())
+                )
+                if self.last_activity:
+                    self.status_label.configure(
+                        text=f"{self.last_activity}  ·  {stage_elapsed}"
+                    )
+                if self.current_item is not None:
+                    refs = self.row_refs.get(self.current_item.document_id)
+                    if refs:
+                        refs["sub"].configure(
+                            text=(
+                                f"{self.current_item.activity}  ·  "
+                                f"{stage_elapsed}  ·  "
+                                f"{self.current_item.filename}"
+                            )
+                        )
+            except Exception:
+                self._write_diagnostic(
+                    "Timing/status update failed:\n"
+                    + traceback.format_exc()
+                )
+            finally:
+                if self.running and generation == self._timing_generation:
+                    try:
+                        self.after(
+                            500, lambda gen=generation: self._tick_timing(gen)
+                        )
+                    except Exception:
+                        self._timing_active = False
+                elif generation == self._timing_generation:
+                    self._timing_active = False
 
         # ---------------------------------------------------------- log
+        def _write_diagnostic(self, text):
+            """Append diagnostics beside settings; failures are non-fatal."""
+            try:
+                folder = config_dir()
+                folder.mkdir(parents=True, exist_ok=True)
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                path = diagnostic_log_path()
+                try:
+                    if path.stat().st_size > 2_000_000:
+                        path.replace(path.with_suffix(".log.old"))
+                except OSError:
+                    pass
+                with path.open(
+                    "a", encoding="utf-8", errors="replace"
+                ) as handle:
+                    handle.write(f"[{stamp}] {text}\n")
+            except Exception:
+                pass
+
         def _append_log(self, line):
+            self._write_diagnostic(str(line))
             self.log_box.configure(state="normal")
             self.log_box.insert("end", f"{line}\n")
             self.log_box.see("end")
@@ -1740,125 +1995,236 @@ if ctk is not None:
 
         # ---------------------------------------------------------- settings dialog
         def _open_settings(self):
+            # Bring an already-open Settings window forward instead of
+            # stacking modal copies that can fight over the grab.
+            if self._settings_dialog is not None:
+                try:
+                    if self._settings_dialog.winfo_exists():
+                        self._settings_dialog.lift()
+                        self._settings_dialog.focus_set()
+                        return
+                except Exception:
+                    self._settings_dialog = None
+
             dialog = ctk.CTkToplevel(self)
+            self._settings_dialog = dialog
             dialog.title("Settings")
-            dialog.geometry("500x560")
-            dialog.resizable(False, False)
+            width = min(540, max(460, self.winfo_screenwidth() - 40))
+            height = min(640, max(520, self.winfo_screenheight() - 80))
+            dialog.geometry(f"{width}x{height}")
+            dialog.minsize(460, 520)
+            dialog.resizable(True, True)
             dialog.configure(fg_color=WINDOW_BG)
             dialog.transient(self)
 
-            body = ctk.CTkFrame(dialog, fg_color="transparent")
-            body.pack(fill="both", expand=True, padx=22, pady=20)
+            # Fixed footer first: Done and save feedback are always visible,
+            # even on small/high-DPI displays where the old fixed-height
+            # dialog could push the buttons beyond the window edge.
+            footer = ctk.CTkFrame(
+                dialog, fg_color=CARD_BG, border_color=CARD_BORDER,
+                border_width=1, corner_radius=0,
+            )
+            footer.pack(side="bottom", fill="x")
+            saved_label = ctk.CTkLabel(
+                footer, text="Changes save automatically.",
+                font=self._font(11), text_color=SUCCESS, anchor="w",
+            )
+            saved_label.pack(side="left", padx=16, pady=12)
+
+            body = ctk.CTkScrollableFrame(
+                dialog, fg_color="transparent",
+                scrollbar_button_color=FIELD_BORDER,
+            )
+            body.pack(fill="both", expand=True, padx=6, pady=(6, 0))
+
+            def mark_saved(ok=True):
+                if ok:
+                    saved_label.configure(
+                        text=f"Saved ✓  {time.strftime('%H:%M:%S')}",
+                        text_color=SUCCESS,
+                    )
+                else:
+                    saved_label.configure(
+                        text=f"Could not save to {settings_path()}",
+                        text_color=ERROR,
+                    )
+                    self._write_diagnostic(
+                        f"Settings save failed: {settings_path()}"
+                    )
+
+            def save_field(name, value):
+                setattr(self.settings, name, value)
+                ok = self.settings.save()
+                mark_saved(ok)
+                return ok
 
             def heading(text):
                 ctk.CTkLabel(
                     body, text=text, font=self._font(13, "bold"), anchor="w"
-                ).pack(fill="x", pady=(14, 6))
+                ).pack(fill="x", padx=16, pady=(14, 6))
 
             def caption(text):
                 ctk.CTkLabel(
-                    body, text=text, font=self._font(11), text_color=TEXT_MUTED,
-                    anchor="w", wraplength=450,
-                ).pack(fill="x", pady=(4, 0))
+                    body, text=text, font=self._font(11),
+                    text_color=TEXT_MUTED, anchor="w", wraplength=450,
+                ).pack(fill="x", padx=16, pady=(4, 0))
 
             ctk.CTkLabel(
                 body, text="Settings", font=self._font(18, "bold"), anchor="w"
-            ).pack(fill="x")
+            ).pack(fill="x", padx=16, pady=(10, 0))
+            caption(
+                "Every change below is saved immediately. Closing this "
+                "window with Done or the X button no longer discards edits. "
+                "Download changes apply from the next document; an already "
+                "running Chrome session keeps its original settings."
+            )
+
+            heading("Appearance")
+            appearance = ctk.CTkSegmentedButton(
+                body, values=["System", "Light", "Dark"],
+                font=self._font(12), selected_color=ACCENT,
+                selected_hover_color=ACCENT_HOVER,
+                command=lambda value: (
+                    mark_saved(self._on_appearance_change(value))
+                ),
+            )
+            appearance.set(self.settings.appearance)
+            appearance.pack(fill="x", padx=16)
 
             heading("Pages loaded at once")
             batch = ctk.CTkSegmentedButton(
                 body, values=["4", "8", "16"], font=self._font(12),
                 selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
+                command=lambda value: save_field("batch_size", int(value)),
             )
-            batch.set(
-                str(self.settings.batch_size)
-                if str(self.settings.batch_size) in ("4", "8", "16") else "8"
+            batch.set(str(self.settings.batch_size))
+            batch.pack(fill="x", padx=16)
+            caption(
+                "Lower uses less memory on image-heavy documents. "
+                "8 is a good default."
             )
-            batch.pack(fill="x")
-            caption("Lower uses less memory on image-heavy documents. 8 is a good default.")
+
+            page_var = tk.StringVar(value=str(self.settings.page_load_timeout))
+            export_var = tk.StringVar(value=str(self.settings.cdp_timeout))
 
             heading("Page load timeout (seconds)")
             page_timeout = ctk.CTkEntry(
-                body, height=36, font=self._font(12), fg_color=FIELD_BG,
+                body, textvariable=page_var, height=36,
+                font=self._font(12), fg_color=FIELD_BG,
                 border_color=FIELD_BORDER, border_width=1,
             )
-            page_timeout.insert(0, str(self.settings.page_load_timeout))
-            page_timeout.pack(fill="x")
+            page_timeout.pack(fill="x", padx=16)
 
             heading("Export timeout (seconds)")
             export_timeout = ctk.CTkEntry(
-                body, height=36, font=self._font(12), fg_color=FIELD_BG,
+                body, textvariable=export_var, height=36,
+                font=self._font(12), fg_color=FIELD_BG,
                 border_color=FIELD_BORDER, border_width=1,
             )
-            export_timeout.insert(0, str(self.settings.cdp_timeout))
-            export_timeout.pack(fill="x")
+            export_timeout.pack(fill="x", padx=16)
             caption("Raise these only for very large or slow-loading documents.")
 
-            heading("Behaviour")
-            show_browser = ctk.CTkSwitch(
-                body, text="Show Chrome window while downloading (for troubleshooting)",
-                font=self._font(12), progress_color=ACCENT,
-            )
-            show_browser.pack(fill="x", pady=4)
-            if self.settings.show_browser:
-                show_browser.select()
-            open_done = ctk.CTkSwitch(
-                body, text="Open the PDF when a single download finishes",
-                font=self._font(12), progress_color=ACCENT,
-            )
-            open_done.pack(fill="x", pady=4)
-            if self.settings.open_when_done:
-                open_done.select()
-            clipboard = ctk.CTkSwitch(
-                body, text="Detect Scribd links on the clipboard",
-                font=self._font(12), progress_color=ACCENT,
-            )
-            clipboard.pack(fill="x", pady=4)
-            if self.settings.clipboard_check:
-                clipboard.select()
-
             error_label = ctk.CTkLabel(
-                body, text="", font=self._font(11), text_color=ERROR, anchor="w"
+                body, text="", font=self._font(11), text_color=ERROR,
+                anchor="w", wraplength=450,
             )
-            error_label.pack(fill="x", pady=(8, 0))
+            error_label.pack(fill="x", padx=16, pady=(8, 0))
 
-            def save():
+            def commit_timeouts():
                 try:
-                    page_value = int(page_timeout.get())
-                    export_value = int(export_timeout.get())
-                    if not (10 <= page_value <= 600 and 30 <= export_value <= 3600):
-                        raise ValueError
-                except ValueError:
-                    error_label.configure(
-                        text="Timeouts must be whole numbers (page: 10–600, export: 30–3600)."
+                    page_value, export_value = validate_timeout_values(
+                        page_var.get(), export_var.get()
                     )
-                    return
-                self.settings.batch_size = int(batch.get())
+                except ValueError as error:
+                    error_label.configure(text=str(error))
+                    page_timeout.configure(border_color=ERROR)
+                    export_timeout.configure(border_color=ERROR)
+                    saved_label.configure(
+                        text="Fix the highlighted timeout before closing.",
+                        text_color=ERROR,
+                    )
+                    return False
+                error_label.configure(text="")
+                page_timeout.configure(border_color=FIELD_BORDER)
+                export_timeout.configure(border_color=FIELD_BORDER)
+                if (
+                    page_value == self.settings.page_load_timeout
+                    and export_value == self.settings.cdp_timeout
+                ):
+                    return True
                 self.settings.page_load_timeout = page_value
                 self.settings.cdp_timeout = export_value
-                self.settings.show_browser = bool(show_browser.get())
-                self.settings.open_when_done = bool(open_done.get())
-                self.settings.clipboard_check = bool(clipboard.get())
-                self.settings.save()
+                mark_saved(self.settings.save())
+                return True
+
+            for entry in (page_timeout, export_timeout):
+                entry.bind("<FocusOut>", lambda _event: commit_timeouts())
+                entry.bind("<Return>", lambda _event: commit_timeouts())
+
+            heading("Behaviour")
+
+            def add_switch(text, attribute):
+                switch = ctk.CTkSwitch(
+                    body, text=text, font=self._font(12),
+                    progress_color=ACCENT,
+                )
+                switch.pack(fill="x", padx=16, pady=4)
+                if getattr(self.settings, attribute):
+                    switch.select()
+                switch.configure(
+                    command=lambda sw=switch, attr=attribute: save_field(
+                        attr, bool(sw.get())
+                    )
+                )
+                return switch
+
+            add_switch(
+                "Show Chrome window while downloading (for troubleshooting)",
+                "show_browser",
+            )
+            add_switch(
+                "Open the PDF when a single download finishes",
+                "open_when_done",
+            )
+            add_switch(
+                "Detect Scribd links on the clipboard", "clipboard_check"
+            )
+            caption(f"Saved in: {settings_path()}")
+
+            def close_settings():
+                if not commit_timeouts():
+                    dialog.focus_set()
+                    return
+                self._settings_dialog = None
+                try:
+                    dialog.grab_release()
+                except Exception:
+                    pass
                 dialog.destroy()
 
-            row = ctk.CTkFrame(body, fg_color="transparent")
-            row.pack(fill="x", pady=(14, 0))
             ctk.CTkButton(
-                row, text="Save", width=110, height=38, font=self._font(12, "bold"),
-                fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="white",
-                command=save,
-            ).pack(side="right")
-            self._ghost_button(row, "Cancel", 100, dialog.destroy).pack(
-                side="right", padx=(0, 8)
-            )
+                footer, text="Done", width=110, height=38,
+                font=self._font(12, "bold"), fg_color=ACCENT,
+                hover_color=ACCENT_HOVER, text_color="white",
+                command=close_settings,
+            ).pack(side="right", padx=16, pady=10)
+            dialog.protocol("WM_DELETE_WINDOW", close_settings)
+            dialog.bind("<Escape>", lambda _event: close_settings())
 
             dialog.update_idletasks()
-            x = self.winfo_rootx() + (self.winfo_width() - 500) // 2
-            y = self.winfo_rooty() + (self.winfo_height() - 560) // 2
+            x = self.winfo_rootx() + (self.winfo_width() - width) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - height) // 2
             dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
-            dialog.grab_set()
-            dialog.focus_set()
+
+            def grab_when_viewable():
+                try:
+                    if dialog.winfo_exists():
+                        dialog.grab_set()
+                        dialog.focus_set()
+                except Exception:
+                    pass
+
+            dialog.after(60, grab_when_viewable)
 
         # ---------------------------------------------------------- close
         def _on_close(self):

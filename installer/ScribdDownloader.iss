@@ -17,7 +17,7 @@
 ; version_info.txt (tests/test_packaging.py checks this).
 
 #define MyAppName "Scribd Downloader"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "Scribd Downloader contributors"
 #define MyAppURL "https://github.com/Lordhussnain/scribd-downloader"
 #define MyAppExeName "ScribdDownloader.exe"
