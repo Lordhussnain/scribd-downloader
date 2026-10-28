@@ -41,16 +41,22 @@ security updates. Review the bundled browser and driver licence terms before
 redistribution. The app prefers the bundled pair even if `CHROMEDRIVER` is set;
 a missing file in an existing `runtime` folder is reported as an error.
 
-### Download a GitHub Actions build
+### Download automated Windows builds
 
-The **Windows portable build** workflow runs on pushes, pull requests, and
-manual dispatch. It runs the Rust tests and builds a portable Windows x64
-package with the latest stable matching Chrome for Testing and ChromeDriver
-available when the workflow runs. In GitHub, open **Actions → Windows portable
-build**, choose a successful run, and download the
-`ScribdDownloader-Windows-x64` artifact. Extract it and keep `runtime` next to
-`scribd-rust-gui.exe`. Artifacts expire after 14 days; the workflow does not
-create a GitHub Release or automatically update existing installations.
+The **Windows portable build** workflow tests and packages the app on pushes and
+pull requests. Successful scheduled and manually dispatched builds, plus pushes
+to the default branch, also publish a ZIP as an **experimental pre-release**
+under GitHub **Releases**. Each release includes a matched stable Chrome for
+Testing and ChromeDriver, selected when the build runs. Extract the ZIP and
+keep the `runtime` folder next to `scribd-rust-gui.exe`.
+
+The schedule runs every Sunday at 02:00 UTC (07:00 Pakistan time). GitHub runs
+scheduled workflows from the repository's **default branch**, so the schedule
+and automatic releases begin only after this workflow is merged into that branch.
+GitHub may delay scheduled runs and can disable schedules in inactive public
+repositories. Feature-branch pushes and pull requests produce workflow artifacts
+only; those artifacts expire after 14 days. Experimental pre-releases do not
+replace a stable release or automatically update installed copies.
 
 ### Build an installer
 
