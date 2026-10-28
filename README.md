@@ -1,145 +1,130 @@
-# Scribd Downloader — Rust preview
+# Scribd Downloader
 
-A Windows-focused Rust desktop app that renders accessible Scribd documents
-in Chrome and exports them to PDF.
+A Windows desktop app built in Rust for exporting accessible Scribd documents to PDF. Add links to a queue, choose where to save them, and follow each document's progress from the desktop interface.
 
-**Status:** This is an experimental rewrite. The portable build and installer
-have not yet been verified on a clean Windows 10 machine or against live
-Scribd documents. Check exported PDFs before relying on them.
+[Download Windows builds](https://github.com/Lordhussnain/scribd-downloader/releases) · [View build workflows](https://github.com/Lordhussnain/scribd-downloader/actions) · [Report an issue](https://github.com/Lordhussnain/scribd-downloader/issues)
 
-## Build a portable package on Windows
+> **Experimental software:** This Rust rewrite and its packaging are still being validated. A Windows CI build has succeeded, but the app has not been verified end-to-end against live documents on a clean Windows installation. Check exported PDFs before relying on them. Only download documents you have the right to access and save.
 
-On the **build PC**, install Rust stable with the x86-64 MSVC toolchain and
-Visual Studio C++ build tools. The first build needs internet access to download
-Rust dependencies and a matching stable Chrome for Testing / ChromeDriver pair.
-From PowerShell in the repository root, run:
+## Features
+
+- **Document queue:** Add multiple links, edit filenames, retry items, skip a document, or stop the queue.
+- **Flexible input:** Paste links, import a link file, or drop supported link files into the window. Clipboard detection can append newly copied links when you return to the app, without duplicating document IDs already in the input.
+- **Download progress:** See the current activity, completed pages, elapsed time, and an estimated time remaining when available.
+- **Save controls:** Choose an output folder and save a copy, skip, or overwrite when a file already exists.
+- **Desktop preferences:** Light, dark, and system appearance; page loading and timeout settings; optional browser and ChromeDriver diagnostic windows; and an option to open the PDF when finished.
+- **Local state:** Settings, recent downloads, pending queue items, and diagnostics are kept on your computer.
+
+The app uses Chrome and ChromeDriver to render accessible document pages and merge them into a PDF. It does not guarantee access to restricted, private, removed, or protected documents.
+
+## Download and run
+
+1. Open the [Releases page](https://github.com/Lordhussnain/scribd-downloader/releases) and select an **experimental pre-release** for the package you want. Releases may be listed separately for each package type.
+2. Download its Windows x64 ZIP and extract it.
+3. Open the extracted folder and run `scribd-rust-gui.exe`. Keep the entire folder together, including `runtime` if present.
+
+All packages target **64-bit Windows 10 or 11**. Internet access, standard Windows system components, and a compatible graphics driver are required. Rust and Python are **not** required on the target PC.
+
+### Choose a package
+
+| Package | What's included | What you need to install | Trade-off |
+| --- | --- | --- | --- |
+| **Full portable** (`ScribdDownloader-Windows-x64.zip`) | App, Chrome for Testing, and matching ChromeDriver | Nothing extra for the browser | Largest download; easiest to move to another PC |
+| **Driver-only** (`ScribdDownloader-DriverOnly-Windows-x64.zip`) | App and the latest stable ChromeDriver at build time | A compatible installation of Google Chrome | Smaller; Chrome and the bundled driver must be compatible |
+| **System** (`ScribdDownloader-System-Windows-x64.zip`) | App only | Chrome and a compatible ChromeDriver on `PATH`, or `CHROMEDRIVER` set to the driver's full path | Smallest; you manage both dependencies |
+
+The driver-only build uses the installed Chrome; it does not automatically match the driver to your installed browser. The bundled browser and driver do not update themselves. Download a newer build regularly for browser security updates and compatibility. Review their licence terms before redistribution.
+
+> The two smaller package variants and their release workflows have not yet been verified end-to-end on Windows. Package sizes depend on the build and compression; the extracted folder will be larger than the ZIP.
+
+## Use the app
+
+1. Paste one or more Scribd links into the input box and select **Add to queue**. You can also use **Add from file…** or drop a supported link file into the window.
+2. Choose an output folder under **Save PDFs to** and select an existing-file policy.
+3. Select **Download PDF**. Documents are processed one at a time.
+4. Follow progress in the download card. Use **Skip current document** or **Stop queue** if needed.
+
+To append copied links automatically, enable **Settings → Detect Scribd links from clipboard**. When you return focus to the app, new links are appended to the existing input; links for document IDs already present are skipped. The **Paste** button is also available.
+
+Cancellation is cooperative: a stop or skip can wait for the current browser operation to finish or time out. If you close the window during a download, cancellation is requested; wait for the current item to finish before closing again.
+
+### Settings and diagnostics
+
+On Windows, settings, recent downloads, and pending queue items are stored in:
+
+```text
+%APPDATA%\ScribdDownloader\settings-rust.json
+```
+
+The activity log is saved as `diagnostic-rust.log` in the same folder. Use **Diagnostics folder** in the app to open it. For troubleshooting, **Settings → Show Chrome window while downloading** displays Chrome; **Show ChromeDriver console (diagnostics)** independently displays the driver console for the next download.
+
+## Build from source
+
+### Requirements
+
+On the **build PC**, install:
+
+- Rust stable with the `x86_64-pc-windows-msvc` target and Cargo.
+- Visual Studio C++ build tools with the MSVC toolchain.
+- Internet access to fetch Rust dependencies and, for bundled packages, Chrome for Testing components.
+- Inno Setup 6 only if building the optional installer.
+
+Clone the repository and open PowerShell in its root:
+
+```powershell
+git clone https://github.com/Lordhussnain/scribd-downloader.git
+cd scribd-downloader
+```
+
+### Build the full portable package
 
 ```powershell
 .\build_windows.bat
 ```
 
-The package is created at:
+The script builds the app with the static MSVC runtime and downloads a matched stable Chrome for Testing and ChromeDriver pair. The resulting folder is:
 
 ```text
 dist\ScribdDownloader-Portable\
   scribd-rust-gui.exe
-  runtime\chrome-win64\          # Chrome for Testing, including its files
-  runtime\chromedriver-win64\    # matching ChromeDriver
   PACKAGE-INFO.txt
+  runtime\
+    package-mode.txt
+    chrome-win64\
+    chromedriver-win64\
 ```
 
-Copy **the entire folder**, not just the `.exe`, to a 64-bit Windows 10 or 11
-PC, and run `scribd-rust-gui.exe`. The target PC does not need Rust, Python,
-Google Chrome, or ChromeDriver installed. Internet is still needed to access
-Scribd documents. The Rust app is built with the static MSVC runtime; standard
-Windows system components and a compatible graphics driver are still required.
-This packaging has not yet been tested on a clean Windows installation.
+Copy the **entire folder** to the target PC. The app prefers this bundled pair over `CHROMEDRIVER` or a system installation; an incomplete bundled runtime is reported as an error.
 
-The bundled Chrome for Testing is fixed at the version selected when you build;
-it does **not** auto-update. Rebuild and redistribute regularly for browser
-security updates. Review the bundled browser and driver licence terms before
-redistribution. The app prefers the bundled pair even if `CHROMEDRIVER` is set;
-a missing file in an existing `runtime` folder is reported as an error.
-
-### Download automated Windows builds
-
-The **Windows portable build** workflow tests and packages the app on pushes and
-pull requests. Successful scheduled and manually dispatched builds, plus pushes
-to the default branch, also publish a ZIP as an **experimental pre-release**
-under GitHub **Releases**. Each release includes a matched stable Chrome for
-Testing and ChromeDriver, selected when the build runs. Extract the ZIP and
-keep the `runtime` folder next to `scribd-rust-gui.exe`. The download includes
-Chrome and is compressed to reduce its size; the extracted folder will be
-larger. For a smaller package, use the unbundled development build, which
-requires a separately installed Chrome and compatible ChromeDriver.
-
-The schedule runs every Sunday at 02:00 UTC (07:00 Pakistan time). GitHub runs
-scheduled workflows from the repository's **default branch**, so the schedule
-and automatic releases begin only after this workflow is merged into that branch.
-GitHub may delay scheduled runs and can disable schedules in inactive public
-repositories. Feature-branch pushes and pull requests produce workflow artifacts
-only; those artifacts expire after 14 days. Experimental pre-releases do not
-replace a stable release or automatically update installed copies.
-
-### Smaller Windows packages
-
-There are two additional weekly Windows release workflows:
-
-| Package | Included | Required on the target PC | Weekly schedule |
-| --- | --- | --- | --- |
-| Driver-only | App and latest stable ChromeDriver | Google Chrome compatible with the bundled driver | Sunday 02:15 UTC (07:15 Pakistan) |
-| System | App only | Chrome and a compatible ChromeDriver on `PATH`, or `CHROMEDRIVER` set to the driver's full path | Sunday 02:30 UTC (07:30 Pakistan) |
-
-Neither package needs Rust or Python on the target PC. Both use the static MSVC
-runtime for the Rust executable and still need standard Windows system components.
-The driver-only package uses the installed Chrome; its latest-stable bundled
-driver can become incompatible if the installed Chrome is a different version.
-Neither the bundled driver nor the app updates itself. Rebuild or download a
-new release when necessary. Copy the entire extracted folder so the driver-only
-package retains its `runtime` directory.
-
-Scheduled and manually dispatched builds, and default-branch pushes, publish
-separate experimental pre-releases. Other branch pushes and pull requests only
-upload artifacts. As with the full package, weekly schedules start only after
-these workflow files are merged into the default branch. Run locally on a
-Windows build PC with:
+### Build a smaller package
 
 ```powershell
+# App and ChromeDriver; Chrome is installed separately
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_portable.ps1 -Mode DriverOnly
+
+# App only; Chrome and ChromeDriver are installed separately
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_portable.ps1 -Mode System
 ```
 
-The output folders are `dist\ScribdDownloader-DriverOnly` and
-`dist\ScribdDownloader-System`. These new variants and their workflows have
-not yet been verified on Windows.
+The output folders are `dist\ScribdDownloader-DriverOnly` and `dist\ScribdDownloader-System`. Keep `runtime` with the executable in the driver-only package. For system builds, the app uses `CHROMEDRIVER` if set, otherwise it looks for ChromeDriver on `PATH`.
 
 ### Build an installer
 
-Install Inno Setup 6 on the build PC and run:
+With Inno Setup 6 installed, run:
 
 ```powershell
 .\build_installer.bat
 ```
 
-The installer in `dist\installer` includes the same app and matching browser
-runtime. It is not yet verified on Windows. To build just the executable for
-development, use `cargo run --release --manifest-path rust-gui\Cargo.toml`;
-that unbundled executable requires a locally installed Chrome and compatible
-ChromeDriver on PATH or configured with `CHROMEDRIVER`.
+The installer is written to `dist\installer` and includes the **full** portable package. Installer behavior has not yet been verified on a clean Windows PC.
 
-## Using the preview
-
-Paste Scribd links into the text box and choose **Add to queue**, or use
-**Add from file** to import supported link files. Choose an output folder and
-an existing-file policy, then start the queue. The app processes documents
-one at a time. It provides progress, retry, skip, stop, filename editing,
-batch-size and timeout controls, and a visible-Chrome troubleshooting mode.
-On Windows, ChromeDriver's console is hidden by default. To show it for the
-next download, enable **Settings → Show ChromeDriver console (diagnostics)**.
-This is independent of **Show Chrome window while downloading**.
-
-When clipboard detection is enabled, returning to the app with a new Scribd
-link copied appends it to the input, preserving any existing text and links.
-Links already in the input are skipped by document ID. While a document is running,
-the progress card shows the current activity, completed pages, elapsed time,
-and an estimated remaining time when enough page information is available.
-During connection and initial loading, a spinner indicates that the total is
-not yet known; PDF merging can continue after all pages have been exported.
-
-Cancellation is cooperative and may wait for a browser operation to finish or
-time out. Closing the window during a download requests cancellation; wait for
-the current item to finish before closing again.
-
-## Tests on Windows 10
-
-Install Rust stable (MSVC) and the Visual Studio C++ build tools, then open
-PowerShell in the repository root. Run all automated tests with:
+### Run tests
 
 ```powershell
 .\test_windows.bat
 ```
 
-Or run each suite separately:
+Or run the suites individually:
 
 ```powershell
 cargo test --manifest-path rust-core\Cargo.toml
@@ -147,47 +132,40 @@ cargo test --manifest-path rust-browser\Cargo.toml
 cargo test --manifest-path rust-gui\Cargo.toml
 ```
 
-Cargo downloads dependencies the first time. The tests use fakes or local
-loopback responses and temporary files; they do not require a live Scribd
-connection or launch Chrome. GUI tests exercise settings and theme logic, not
-actual window interactions. To manually verify the whole app, build the portable package and run it as
-described above. Test with a
-document you have permission to download: check the PDF's pages and images,
-then try a two-item queue, stop/skip, retry, file conflicts, and reopening the
-app to confirm settings and pending items are restored. The GUI and browser
-backend have not yet been validated on Windows against live documents.
+Automated tests use fakes, local loopback responses, or temporary files; they do not validate a live Scribd download or actual GUI interactions. For an end-to-end check, try a document you are allowed to download and inspect the PDF pages and images. Also test the queue, cancellation, file-conflict options, and restored settings.
 
-## Settings and diagnostics
+## Automated builds and releases
 
-The preview saves settings, recent downloads and unfinished queue items to
-`%APPDATA%\ScribdDownloader\settings-rust.json`. The activity log is written
-to `diagnostic-rust.log` in the same folder. The app offers light/dark/system
-appearance, clipboard detection, dropped link files, recents, and open-when-done.
-These additions have not yet been verified on Windows.
+GitHub Actions tests and builds all three variants. Successful scheduled runs, manual runs, and pushes to the default branch publish separate **experimental pre-releases**. Pull requests and feature-branch pushes upload workflow artifacts instead; artifacts expire after 14 days. Pre-releases do not replace a stable release or update installed copies.
 
-## Limitations
+| Workflow | Sunday schedule | Pakistan time |
+| --- | --- | --- |
+| Full portable | 02:00 UTC | 07:00 |
+| Driver-only | 02:15 UTC | 07:15 |
+| System | 02:30 UTC | 07:30 |
 
-- The GUI is not yet feature-complete compared with the earlier desktop app;
-  browser-link drag-and-drop and exact feature parity remain. The ETA is an estimate.
-- The GUI and browser backend have not been compiled or tested on Windows.
-- The bundled browser and driver do not update themselves; rebuild to receive security updates.
-- Driver-only and system packages require a compatible installed Chrome; the
-  system package also requires ChromeDriver separately.
-- Private, removed, restricted, or protected documents may fail. Scribd can
-  change its embed page structure, which may require updates.
-- Very large documents may require substantial temporary disk space.
+GitHub runs scheduled workflows from the repository's **default branch**, so each schedule begins only after its workflow is merged there. Scheduled runs may be delayed or disabled after public-repository inactivity. Automatic publishing also requires GitHub Actions to have permission to write repository contents.
 
 ## Project structure
 
-- `rust-core/` — shared URL, filename, queue, browser scripts and download
-  orchestration logic.
-- `rust-browser/` — ChromeDriver integration and PDF printing/merging.
-- `rust-gui/` — desktop interface.
-- `assets/` — existing project artwork.
+```text
+rust-core/       URL parsing, queue, download orchestration, and shared logic
+rust-browser/    ChromeDriver integration and PDF printing/merging
+rust-gui/        Desktop interface and settings
+assets/          Application artwork and installer assets
+installer/       Inno Setup configuration
+.github/         Windows build and release workflows
+```
 
-## Disclaimer
+## Limitations
 
-Use this tool only for documents you have the right to access and download.
-Respect copyright, document licences and Scribd's terms of service. The project
-has historically been described as MIT-licensed but does not currently include
-a standalone licence file; check with the maintainers before redistributing.
+- This is an experimental rewrite; some features and interactions may differ from the earlier desktop app. Browser-link drag-and-drop and exact feature parity are not complete.
+- Scribd can change its page structure, and inaccessible documents may fail. Large documents can require substantial temporary disk space.
+- Progress and remaining-time estimates are approximate. PDF merging can continue after the pages have been exported.
+- Chrome/ChromeDriver version mismatches can prevent a browser session from starting, particularly in the smaller packages.
+
+## Responsible use and licence
+
+Use this software only for documents you have the right to access and download. Respect copyright, document licences, and Scribd's terms of service.
+
+The project has historically been described as MIT-licensed, but it does not currently include a standalone licence file. Check with the maintainers before redistributing.
