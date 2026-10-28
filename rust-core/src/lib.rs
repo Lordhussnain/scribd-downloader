@@ -1,6 +1,4 @@
-//! URL and filename helpers ported from the Python download engine.
-//!
-//! This crate is not yet connected to the Python GUI or download engine.
+//! Shared URL, filename, queue, and download helpers for Scribd Downloader.
 
 pub mod download;
 pub mod engine;
@@ -27,14 +25,13 @@ pub struct ScribdDocument {
 fn url_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        // Intentionally matches the existing Python helper, including finding
-        // links inside pasted prose rather than requiring a complete URL.
+        // Find links inside pasted prose rather than requiring a complete URL.
         Regex::new(r"(?i)scribd\.com/(?:document|doc|embeds)/(\d+)(?:/([^/?#\s]+))?")
             .expect("valid Scribd URL pattern")
     })
 }
 
-/// Apply the same Windows filename rules as the Python engine.
+/// Apply Windows-safe filename rules.
 /// The PDF extension is deliberately not appended.
 pub fn sanitize_filename(name: &str, fallback: &str) -> String {
     let replaced: String = name.chars().map(|c| {

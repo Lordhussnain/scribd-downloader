@@ -1,5 +1,5 @@
-//! JavaScript used by the browser backend. Copied from the existing engine,
-//! with WebDriver's `arguments` convention preserved.
+//! JavaScript used by the browser backend,
+//! using WebDriver's `arguments` convention.
 pub const HIDE_COOKIE_DIALOGS: &str = include_str!("browser_scripts/hide_cookie_dialogs.js");
 pub const PREPARE_PRINT: &str = include_str!("browser_scripts/prepare_print.js");
 pub const PRINT_STYLES: &str = include_str!("browser_scripts/print_styles.js");

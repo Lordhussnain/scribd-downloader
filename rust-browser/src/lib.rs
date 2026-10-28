@@ -8,17 +8,17 @@ use std::{net::TcpListener, path::{Path, PathBuf}, process::{Child, Command, Std
 pub struct Browser {
     driver: Option<Child>, session: Option<String>, port: u16, agent: ureq::Agent,
     temp: tempfile::TempDir, pages: Vec<PathBuf>,
-    show_browser: bool, page_timeout: Duration,
+    show_browser: bool, page_timeout: Duration, overwrite: bool,
 }
 
 impl Browser {
-    pub fn new(show_browser: bool, page_timeout: Duration, command_timeout: Duration) -> Result<Self, String> {
+    pub fn new(show_browser: bool, page_timeout: Duration, command_timeout: Duration, overwrite: bool) -> Result<Self, String> {
         let temp = tempfile::Builder::new().prefix("scribd-rust-").tempdir().map_err(|e| e.to_string())?;
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         drop(listener);
         let agent = ureq::AgentBuilder::new().timeout(command_timeout).build();
-        Ok(Self { driver: None, session: None, port, agent, temp, pages: Vec::new(), show_browser, page_timeout })
+        Ok(Self { driver: None, session: None, port, agent, temp, pages: Vec::new(), show_browser, page_timeout, overwrite })
     }
     fn call(&self, method: &str, route: &str, payload: Option<Value>) -> Result<Value, String> {
         let url = format!("http://127.0.0.1:{}{}", self.port, route);
@@ -128,7 +128,11 @@ impl DownloadBackend for Browser {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
         merged.save_to(file.as_file_mut()).map_err(|e| e.to_string())?;
-        file.persist(output).map_err(|e| e.to_string())?;
+        if self.overwrite {
+            file.persist(output).map_err(|e| e.to_string())?;
+        } else {
+            file.persist_noclobber(output).map_err(|e| format!("Could not save without overwriting an existing file: {e}"))?;
+        }
         Ok(output.to_owned())
     }
     fn cleanup(&mut self) {
@@ -156,7 +160,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("1.pdf"); let second = dir.path().join("2.pdf"); let output = dir.path().join("result.pdf");
         page(&first, 100); page(&second, 300);
-        let mut browser = Browser::new(false, Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+        let mut browser = Browser::new(false, Duration::from_secs(1), Duration::from_secs(1), true).unwrap();
         browser.pages = vec![first, second];
         browser.merge(&output).unwrap();
         let result = Document::load(&output).unwrap();

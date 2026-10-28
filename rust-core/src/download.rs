@@ -1,7 +1,6 @@
-//! Backend-independent download orchestration. This is not a browser backend.
+//! Backend-independent download orchestration.
 //!
-//! The backend must provide browser operations and safe temporary PDF storage.
-//! There is intentionally no production backend yet; tests use a fake.
+//! Browser operations and temporary PDF storage are provided by a backend.
 use crate::engine::{BatchDecision, BatchStatus, BatchTracker};
 use std::{path::{Path, PathBuf}, sync::atomic::{AtomicBool, Ordering}, thread, time::{Duration, Instant}};
 
