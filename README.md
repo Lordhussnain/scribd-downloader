@@ -663,3 +663,61 @@ This tool is for educational and personal use with documents you have the right 
 <p align="center">
   If this is useful to you, please consider giving the repository a ⭐
 </p>
+
+## Incremental Rust port
+
+`rust-core/` is the first step toward a Windows 10 Rust version. It ports the
+Scribd URL parsing, link extraction, Windows filename helpers, the queue
+model, settings validation, link-file import, output conflict selection, and
+browser-independent engine page/batch tracking and download orchestration into a
+Rust library. The orchestration is tested with a fake backend only; browser
+scripts are shared with the new Rust ChromeDriver/PDF backend. The backend and
+GUI still need build, Windows and real-document verification. Settings
+persistence and several GUI features are not yet ported. The original Python
+app and its Windows builds remain unchanged.
+
+To test this component on Windows 10, install the Rust stable MSVC toolchain
+(using [rustup](https://rustup.rs/)) and the Visual C++ build tools, then run:
+
+```powershell
+cd rust-core
+cargo test
+```
+
+The Rust tests require no Chrome, Scribd access, or Python. Cargo needs network
+access on the first run to obtain the crate dependencies. The current supported
+Rust minimum is 1.70; Windows execution and eventual packaging still need to be
+verified on a Windows 10 machine.
+
+### Rust desktop preview (no Python runtime)
+
+The Rust preview uses Google Chrome and a compatible **ChromeDriver**. It does
+not use the Python engine. It is under development: the Rust browser/PDF backend
+and GUI have not yet been built or tested on Windows or against a live Scribd
+document. Keep the original app available, and verify output before relying on
+it. Only download documents you have permission to access.
+
+On Windows 10 or 11:
+
+1. Install the Rust stable MSVC toolchain and Visual Studio C++ build tools.
+2. Install Google Chrome and a ChromeDriver version matching your Chrome.
+   Put `chromedriver.exe` on `PATH`, or set the `CHROMEDRIVER` environment
+   variable to its full path. The Rust preview does not download it for you.
+3. Open PowerShell in the repository root and run:
+
+   ```powershell
+   cargo run --manifest-path rust-gui\Cargo.toml --release
+   ```
+
+   Cargo downloads dependencies on the first build. The executable is then at
+   `rust-gui\target\release\scribd-rust-gui.exe`. Chrome and ChromeDriver
+   are still required; Python is not required for this executable.
+
+The preview includes link/file import, queue controls, progress, filename and
+output selection, conflict policy, cancellation, retry, and batch/timeout
+controls. It does **not** yet have full parity with the Python GUI: settings
+and pending work are not persisted, and drag-and-drop, clipboard detection,
+themes, recent downloads, open-when-done and installer integration are missing.
+The stop command is cooperative; it may wait for a browser operation to time
+out. If you close the window during a download, the GUI requests cancellation;
+wait for the download to finish before closing again.

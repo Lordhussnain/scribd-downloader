@@ -1,0 +1,11 @@
+[package]
+name = "scribd-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Incremental Rust port of Scribd Downloader's shared helpers"
+publish = false
+
+[dependencies]
+regex = "1"
+percent-encoding = "2"
