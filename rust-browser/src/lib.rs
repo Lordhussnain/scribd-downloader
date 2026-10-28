@@ -8,7 +8,7 @@ use std::{net::TcpListener, path::{Path, PathBuf}, process::{Child, Command, Std
 pub struct Browser {
     driver: Option<Child>, session: Option<String>, port: u16, agent: ureq::Agent,
     temp: tempfile::TempDir, pages: Vec<PathBuf>,
-    show_browser: bool, page_timeout: Duration, overwrite: bool,
+    show_browser: bool, page_timeout: Duration, overwrite: bool, show_driver_console: bool,
 }
 
 impl Browser {
@@ -18,7 +18,31 @@ impl Browser {
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         drop(listener);
         let agent = ureq::AgentBuilder::new().timeout(command_timeout).build();
-        Ok(Self { driver: None, session: None, port, agent, temp, pages: Vec::new(), show_browser, page_timeout, overwrite })
+        Ok(Self { driver: None, session: None, port, agent, temp, pages: Vec::new(), show_browser, page_timeout, overwrite, show_driver_console: false })
+    }
+    /// Show the ChromeDriver console for troubleshooting. By default Windows
+    /// starts it without a console window. This does not control Chrome itself.
+    pub fn with_driver_console(mut self, show: bool) -> Self {
+        self.show_driver_console = show;
+        self
+    }
+
+    fn driver_command(&self, executable: std::ffi::OsString) -> Command {
+        let mut command = Command::new(executable);
+        command.arg(format!("--port={}", self.port)).stdin(Stdio::null());
+        if !self.show_driver_console {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW prevents a console flash even for windowed
+            // releases. For diagnostics, explicitly request a new console.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+            command.creation_flags(if self.show_driver_console { CREATE_NEW_CONSOLE } else { CREATE_NO_WINDOW });
+        }
+        command
     }
     fn call(&self, method: &str, route: &str, payload: Option<Value>) -> Result<Value, String> {
         let url = format!("http://127.0.0.1:{}{}", self.port, route);
@@ -45,7 +69,7 @@ impl DownloadBackend for Browser {
     fn open_and_prepare(&mut self, url: &str) -> Result<usize, String> {
         let embed = parse_scribd_url(url).ok_or("Invalid Scribd document URL")?.embed_url;
         let executable = std::env::var_os("CHROMEDRIVER").unwrap_or_else(|| "chromedriver".into());
-        let driver = Command::new(executable).arg(format!("--port={}", self.port)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("Could not start ChromeDriver: {e}. Install a compatible chromedriver and add it to PATH."))?;
+        let driver = self.driver_command(executable).spawn().map_err(|e| format!("Could not start ChromeDriver: {e}. Install a compatible chromedriver and add it to PATH."))?;
         self.driver = Some(driver);
         let deadline = Instant::now() + Duration::from_secs(15);
         while self.call("GET", "/status", None).is_err() {
@@ -251,6 +275,19 @@ mod tests {
         assert!(message.contains("invalid session id"));
         assert!(message.contains("gone"));
         assert!(thread.join().unwrap().starts_with("GET /missing "));
+    }
+
+    #[test]
+    fn driver_console_defaults_hidden_and_is_independent_of_browser_visibility() {
+        let browser = Browser::new(true, Duration::from_secs(1), Duration::from_secs(1), false).unwrap();
+        assert!(browser.show_browser);
+        assert!(!browser.show_driver_console);
+        let browser = browser.with_driver_console(true);
+        assert!(browser.show_browser);
+        assert!(browser.show_driver_console);
+        let command = browser.driver_command("chromedriver".into());
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("chromedriver"));
+        assert!(command.get_args().any(|arg| arg.to_string_lossy().starts_with("--port=")));
     }
 
 }

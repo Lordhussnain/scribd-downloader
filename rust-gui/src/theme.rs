@@ -4,6 +4,20 @@ use eframe::egui::{self, Color32, Frame, Margin, RichText, Rounding, Stroke, Ui,
 pub const ACCENT: Color32 = Color32::from_rgb(12, 122, 120);
 pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(20, 144, 140);
 
+/// Prefer the native Windows UI font when available; retain egui's built-in
+/// fonts as fallbacks for other systems and missing glyphs.
+pub fn install_fonts(ctx: &egui::Context) {
+    if let Some(root) = std::env::var_os("WINDIR") {
+        let path = std::path::PathBuf::from(root).join("Fonts").join("segoeui.ttf");
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert("segoe-ui".into(), egui::FontData::from_owned(bytes));
+            fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "segoe-ui".into());
+            ctx.set_fonts(fonts);
+        }
+    }
+}
+
 pub fn apply(ctx: &egui::Context, dark: bool) {
     let mut visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     let (background, card, field, border, text) = if dark {

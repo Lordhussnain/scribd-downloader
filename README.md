@@ -41,6 +41,17 @@ Paste Scribd links into the text box and choose **Add to queue**, or use
 an existing-file policy, then start the queue. The app processes documents
 one at a time. It provides progress, retry, skip, stop, filename editing,
 batch-size and timeout controls, and a visible-Chrome troubleshooting mode.
+On Windows, ChromeDriver's console is hidden by default. To show it for the
+next download, enable **Settings → Show ChromeDriver console (diagnostics)**.
+This is independent of **Show Chrome window while downloading**.
+
+When clipboard detection is enabled, returning to the app with a new Scribd
+link copied will prefill it. If you have edited the input, the app preserves
+your text and offers **Add copied link** instead. While a document is running,
+the progress card shows the current activity, completed pages, elapsed time,
+and an estimated remaining time when enough page information is available.
+During connection and initial loading, a spinner indicates that the total is
+not yet known; PDF merging can continue after all pages have been exported.
 
 Cancellation is cooperative and may wait for a browser operation to finish or
 time out. Closing the window during a download requests cancellation; wait for

@@ -11,6 +11,7 @@ pub struct Settings {
     pub page_load_timeout: u32,
     pub export_timeout: u32,
     pub show_browser: bool,
+    pub show_driver_console: bool,
     pub open_when_done: bool,
     pub clipboard_check: bool,
     pub conflict_policy: String,
@@ -26,7 +27,7 @@ impl Default for Settings {
     fn default() -> Self {
         let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
         let downloads = home.join("Downloads");
-        Self { output_dir: if downloads.is_dir() { downloads } else { home }.to_string_lossy().into_owned(), appearance: "System".into(), batch_size: 8, page_load_timeout: 120, export_timeout: 600, show_browser: false, open_when_done: false, clipboard_check: true, conflict_policy: "copy".into(), pending_queue: Vec::new(), recents: Vec::new() }
+        Self { output_dir: if downloads.is_dir() { downloads } else { home }.to_string_lossy().into_owned(), appearance: "System".into(), batch_size: 8, page_load_timeout: 120, export_timeout: 600, show_browser: false, show_driver_console: false, open_when_done: false, clipboard_check: true, conflict_policy: "copy".into(), pending_queue: Vec::new(), recents: Vec::new() }
     }
 }
 impl Settings {
@@ -120,6 +121,22 @@ mod tests {
         assert_eq!(restored.appearance, "Light");
         assert_eq!(restored.batch_size, 8);
         assert!(restored.pending_queue.is_empty());
+    }
+
+    #[test]
+    fn driver_console_setting_defaults_off_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Older settings files have no console preference.
+        std::fs::write(&path, r#"{ "show_browser": true }"#).unwrap();
+        let mut settings = Settings::load(&path);
+        assert!(settings.show_browser);
+        assert!(!settings.show_driver_console);
+        settings.show_driver_console = true;
+        settings.save(&path).unwrap();
+        let restored = Settings::load(&path);
+        assert!(restored.show_browser);
+        assert!(restored.show_driver_console);
     }
 
 }

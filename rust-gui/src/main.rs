@@ -27,12 +27,15 @@ struct App {
     page_timeout: u32,
     export_timeout: u32,
     show_browser: bool,
+    show_driver_console: bool,
     settings_open: bool,
     log: String,
     appearance: String,
     open_when_done: bool,
     clipboard_check: bool,
     last_clipboard: String,
+    clipboard_prefill: Option<String>,
+    clipboard_suggestion: Option<String>,
     recents: Vec<state::Recent>,
     save_status: String,
     last_saved: Option<state::Settings>,
@@ -61,7 +64,7 @@ impl App {
             Some(item)
         }).collect();
         let policy = match settings.conflict_policy.as_str() { "skip" => ConflictPolicy::Skip, "overwrite" => ConflictPolicy::Overwrite, _ => ConflictPolicy::Copy };
-        Self { text: String::new(), folder: settings.output_dir.clone(), items, active: None, running: false, policy, batch: settings.batch_size, page_timeout: settings.page_load_timeout, export_timeout: settings.export_timeout, show_browser: settings.show_browser, settings_open: false, log: String::new(), appearance: settings.appearance.clone(), open_when_done: settings.open_when_done, clipboard_check: settings.clipboard_check, last_clipboard: String::new(), recents: settings.recents.clone(), save_status: String::new(), last_saved: Some(settings), current_stage: String::new(), started_at: None, was_focused: false, pages_completed: 0, pages_total: 0, environment_status: Self::environment_status(), input_notice: String::new(), input_error: false }
+        Self { text: String::new(), folder: settings.output_dir.clone(), items, active: None, running: false, policy, batch: settings.batch_size, page_timeout: settings.page_load_timeout, export_timeout: settings.export_timeout, show_browser: settings.show_browser, show_driver_console: settings.show_driver_console, settings_open: false, log: String::new(), appearance: settings.appearance.clone(), open_when_done: settings.open_when_done, clipboard_check: settings.clipboard_check, last_clipboard: String::new(), clipboard_prefill: None, clipboard_suggestion: None, recents: settings.recents.clone(), save_status: String::new(), last_saved: Some(settings), current_stage: String::new(), started_at: None, was_focused: false, pages_completed: 0, pages_total: 0, environment_status: Self::environment_status(), input_notice: String::new(), input_error: false }
     }
 }
 
@@ -91,7 +94,7 @@ impl App {
     fn snapshot(&self) -> state::Settings {
         state::Settings {
             output_dir: self.folder.clone(), appearance: self.appearance.clone(), batch_size: self.batch,
-            page_load_timeout: self.page_timeout, export_timeout: self.export_timeout, show_browser: self.show_browser,
+            page_load_timeout: self.page_timeout, export_timeout: self.export_timeout, show_browser: self.show_browser, show_driver_console: self.show_driver_console,
             open_when_done: self.open_when_done, clipboard_check: self.clipboard_check,
             conflict_policy: match self.policy { ConflictPolicy::Copy => "copy", ConflictPolicy::Skip => "skip", ConflictPolicy::Overwrite => "overwrite" }.into(),
             pending_queue: self.items.iter().filter(|i| matches!(i.status, QueueStatus::Pending | QueueStatus::Downloading)).map(|i| state::Pending { source_url: i.source_url.clone(), filename: i.filename.clone() }).collect(),
@@ -106,10 +109,39 @@ impl App {
             Err(error) => { self.save_status = format!("Could not save settings: {error}"); }
         }
     }
+    /// Only replace text that was automatically prefilled, never a user's edit.
+    fn observe_clipboard(&mut self, text: &str) {
+        if !self.clipboard_check || text == self.last_clipboard { return; }
+        self.last_clipboard = text.to_owned();
+        if extract_scribd_urls(text).is_empty() {
+            self.clipboard_suggestion = None;
+            return;
+        }
+        let may_replace = self.text.trim().is_empty()
+            || self.clipboard_prefill.as_deref() == Some(self.text.as_str());
+        if may_replace {
+            self.text = text.to_owned();
+            self.clipboard_prefill = Some(self.text.clone());
+            self.clipboard_suggestion = None;
+            self.input_notice = "Scribd link detected from clipboard. Review it, then add it to the queue.".into();
+        } else {
+            self.clipboard_suggestion = Some(text.to_owned());
+            self.input_notice = "New Scribd link copied. Add it without replacing your current text.".into();
+        }
+        self.input_error = false;
+    }
+    fn add_clipboard_suggestion(&mut self) {
+        if let Some(text) = self.clipboard_suggestion.take() {
+            let count = self.add(extract_scribd_urls(&text));
+            self.input_error = count == 0;
+            self.input_notice = if count == 0 { "Those documents are already in your queue.".into() } else { format!("Added {count} document{} from clipboard.", if count == 1 { "" } else { "s" }) };
+        }
+    }
     fn read_clipboard(&mut self, add: bool) {
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             Ok(text) => {
                 self.last_clipboard = text.clone();
+                self.clipboard_suggestion = None;
                 let docs = extract_scribd_urls(&text);
                 if !docs.is_empty() {
                     if add {
@@ -176,6 +208,7 @@ impl App {
             "Those documents are already in your queue.".into()
         } else {
             self.text.clear();
+            self.clipboard_prefill = None;
             format!("Added {added} document{} to your queue.", if added == 1 { "" } else { "s" })
         };
         added
@@ -195,6 +228,7 @@ impl App {
         let url = item.source_url.clone();
         let output = path.clone();
         let show_browser = self.show_browser;
+        let show_driver_console = self.show_driver_console;
         let overwrite = self.policy == ConflictPolicy::Overwrite;
         let page_timeout = Duration::from_secs(self.page_timeout as u64);
         let command_timeout = Duration::from_secs(self.export_timeout as u64);
@@ -204,7 +238,10 @@ impl App {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let result = match scribd_browser::Browser::new(show_browser, page_timeout, command_timeout, overwrite) {
-                Ok(mut browser) => download::download(&mut browser, &url, &output, &options, &worker_cancel, &mut |p| { let _ = tx.send(WorkerEvent::Progress(p)); }),
+                Ok(browser) => {
+                    let mut browser = browser.with_driver_console(show_driver_console);
+                    download::download(&mut browser, &url, &output, &options, &worker_cancel, &mut |p| { let _ = tx.send(WorkerEvent::Progress(p)); })
+                },
                 Err(error) => Err(DownloadError::Backend(error)),
             };
             let _ = tx.send(WorkerEvent::Finished(result));
@@ -310,10 +347,10 @@ impl eframe::App for App {
             self.input_notice = if added == 0 { "No new Scribd links found in the dropped files.".into() } else { format!("Added {added} document{} from dropped files.", if added == 1 { "" } else { "s" }) };
         }
         let focused = ctx.input(|i| i.focused);
-        if focused && !self.was_focused && self.clipboard_check && self.text.is_empty() {
-            if let Ok(mut clipboard) = arboard::Clipboard::new() { if let Ok(text) = clipboard.get_text() {
-                if text != self.last_clipboard { self.last_clipboard = text.clone(); if !extract_scribd_urls(&text).is_empty() { self.text = text; } }
-            } }
+        if focused && !self.was_focused && self.clipboard_check {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Ok(text) = clipboard.get_text() { self.observe_clipboard(&text); }
+            }
         }
         self.was_focused = focused;
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)) { self.start_queue(); }
@@ -359,6 +396,7 @@ impl eframe::App for App {
                 ui.add(egui::Slider::new(&mut self.page_timeout, 10..=600).text("Page timeout (seconds)"));
                 ui.add(egui::Slider::new(&mut self.export_timeout, 30..=3600).text("Export timeout (seconds)"));
                 ui.checkbox(&mut self.show_browser, "Show Chrome window while downloading");
+                ui.checkbox(&mut self.show_driver_console, "Show ChromeDriver console (diagnostics)");
                 ui.checkbox(&mut self.open_when_done, "Open PDF when done");
                 ui.checkbox(&mut self.clipboard_check, "Detect Scribd links from clipboard");
                 ui.add_space(6.0);
@@ -384,10 +422,12 @@ impl eframe::App for App {
                             if ui.add(egui::TextEdit::multiline(&mut self.text).hint_text("https://www.scribd.com/document/...").desired_rows(2).desired_width(f32::INFINITY)).changed() {
                                 self.input_notice.clear();
                                 self.input_error = false;
+                                self.clipboard_prefill = None;
                             }
                             ui.horizontal_wrapped(|ui| {
                                 if ui.add(theme::primary("Add to queue")).clicked() { self.add_from_input(); }
                                 if ui.button("Paste").clicked() { self.read_clipboard(true); }
+                                if self.clipboard_suggestion.is_some() && ui.button("Add copied link").clicked() { self.add_clipboard_suggestion(); }
                                 if ui.button("Add from file…").clicked() {
                                     if let Some(paths) = rfd::FileDialog::new().add_filter("Link files", &["txt", "text", "md", "csv", "url", "html", "htm"]).pick_files() {
                                         let docs = import::read_urls_from_files(&paths);
@@ -405,6 +445,40 @@ impl eframe::App for App {
                             }
                         });
                         ui.add_space(10.0);
+
+                        if let (Some(started), Some(active)) = (self.started_at, self.active.as_ref()) {
+                            let item = &self.items[active.index];
+                            theme::card(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new("Downloading").size(16.0).strong());
+                                    ui.label(egui::RichText::new(&item.title).color(theme::muted(ui)));
+                                });
+                                ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    for (key, title) in [("connect", "Connect"), ("load", "Load pages"), ("export", "Export PDF"), ("merge", "Merge")] {
+                                        let color = if self.current_stage == key { theme::ACCENT_LIGHT } else { theme::muted(ui) };
+                                        ui.label(egui::RichText::new(title).strong().size(12.0).color(color));
+                                    }
+                                });
+                                ui.add_space(6.0);
+                                if self.pages_total == 0 {
+                                    ui.horizontal(|ui| { ui.spinner(); ui.label(egui::RichText::new("Connecting and preparing pages…").size(12.0).color(theme::muted(ui))); });
+                                } else {
+                                    let progress = self.pages_completed as f32 / self.pages_total as f32;
+                                    ui.add(egui::ProgressBar::new(progress.clamp(0.0, 1.0)).fill(theme::ACCENT).desired_width(ui.available_width()).show_percentage());
+                                }
+                                let activity = if item.activity.is_empty() { "Starting…" } else { &item.activity };
+                                ui.label(egui::RichText::new(activity).size(12.0));
+                                let elapsed = started.elapsed().as_secs();
+                                let eta = if self.pages_completed > 0 && self.pages_total > self.pages_completed {
+                                    let remaining = elapsed.saturating_mul((self.pages_total - self.pages_completed) as u64) / self.pages_completed as u64;
+                                    format!("  ·  estimated {remaining}s remaining")
+                                } else { String::new() };
+                                let pages = if self.pages_total > 0 { format!("{} / {} pages  ·  ", self.pages_completed, self.pages_total) } else { String::new() };
+                                ui.label(egui::RichText::new(format!("{pages}{elapsed}s elapsed{eta}")).size(12.0).color(theme::muted(ui)));
+                            });
+                            ui.add_space(10.0);
+                        }
 
                         theme::card(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
@@ -440,7 +514,7 @@ impl eframe::App for App {
                                                 if item.status == QueueStatus::Done && ui.small_button("Folder").clicked() { if let Some(path) = &item.output_path { Self::open_path(path, true); } }
                                             });
                                             if item.status == QueueStatus::Pending {
-                                                ui.horizontal(|ui| { ui.label(egui::RichText::new("Filename").size(12.0).color(theme::muted(ui))); ui.add(egui::TextEdit::singleline(&mut item.filename).desired_width(240.0)); });
+                                                ui.horizontal(|ui| { ui.label(egui::RichText::new("Filename").size(12.0).color(theme::muted(ui))); ui.add(egui::TextEdit::singleline(&mut item.filename).desired_width((ui.available_width() - 20.0).max(100.0))); });
                                             } else { ui.label(egui::RichText::new(scribd_core::queue::queue_item_subtext(item)).size(12.0).color(theme::muted(ui))); }
                                             if item.status == QueueStatus::Downloading { ui.add(egui::ProgressBar::new(item.percent as f32 / 100.0).fill(theme::ACCENT).show_percentage()); }
                                         });
@@ -455,7 +529,7 @@ impl eframe::App for App {
                         theme::card(ui, |ui| {
                             theme::section(ui, "Save PDFs to", "Choose a folder and what to do when a file already exists.");
                             ui.horizontal_wrapped(|ui| {
-                                ui.add_enabled(!self.running && self.active.is_none(), egui::TextEdit::singleline(&mut self.folder).desired_width(420.0));
+                                ui.add_enabled(!self.running && self.active.is_none(), egui::TextEdit::singleline(&mut self.folder).desired_width((ui.available_width() - 115.0).max(100.0)));
                                 if ui.add_enabled(!self.running && self.active.is_none(), egui::Button::new("Browse…")).clicked() { if let Some(path) = rfd::FileDialog::new().pick_folder() { self.folder = path.to_string_lossy().into_owned(); } }
                             });
                             ui.add_enabled_ui(!self.running && self.active.is_none(), |ui| { ui.horizontal_wrapped(|ui| {
@@ -472,24 +546,6 @@ impl eframe::App for App {
                             if ui.add_enabled(self.running || self.active.is_some(), egui::Button::new("Stop queue")).clicked() { self.cancel(true); }
                         });
 
-                        if let Some(started) = self.started_at {
-                            ui.add_space(10.0);
-                            theme::card(ui, |ui| {
-                                theme::section(ui, "Download progress", "Your documents are processed one at a time.");
-                                ui.horizontal_wrapped(|ui| {
-                                    for (key, title) in [("connect", "1  Connect"), ("load", "2  Load pages"), ("export", "3  Export PDF"), ("merge", "4  Merge")] {
-                                        let color = if self.current_stage == key { theme::ACCENT_LIGHT } else { theme::muted(ui) };
-                                        ui.label(egui::RichText::new(title).strong().color(color));
-                                    }
-                                });
-                                let elapsed = started.elapsed().as_secs();
-                                let eta = if self.pages_completed > 0 && self.pages_total > self.pages_completed {
-                                    let remaining = elapsed.saturating_mul((self.pages_total - self.pages_completed) as u64) / self.pages_completed as u64;
-                                    format!("  ·  estimated {remaining}s remaining")
-                                } else { String::new() };
-                                ui.label(egui::RichText::new(format!("{elapsed}s elapsed{eta}")).size(12.0).color(theme::muted(ui)));
-                            });
-                        }
 
                         if !self.recents.is_empty() {
                             ui.add_space(10.0);
@@ -535,6 +591,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_drag_and_drop(true).with_inner_size([900.0, 800.0]), ..Default::default() };
     eframe::run_native("Scribd Downloader", options, Box::new(|cc| {
         let app = App::default();
+        theme::install_fonts(&cc.egui_ctx);
         let dark = match app.appearance.as_str() { "Light" => false, "Dark" => true, _ => cc.egui_ctx.style().visuals.dark_mode };
         theme::apply(&cc.egui_ctx, dark);
         Box::new(app)
@@ -607,6 +664,52 @@ mod tests {
         let restored = App::from_settings(saved);
         assert_eq!(restored.items.len(), 2);
         assert!(restored.items.iter().all(|item| item.status == QueueStatus::Pending));
+    }
+
+    #[test]
+    fn clipboard_prefill_updates_when_a_second_link_is_copied() {
+        let mut app = App::from_settings(state::Settings::default());
+        app.observe_clipboard("https://www.scribd.com/document/1/First");
+        assert!(app.text.contains("/1/"));
+        app.observe_clipboard("https://www.scribd.com/document/2/Second");
+        assert!(app.text.contains("/2/"));
+        assert!(app.clipboard_suggestion.is_none());
+    }
+    #[test]
+    fn clipboard_detection_preserves_user_edits_and_offers_the_new_link() {
+        let mut app = App::from_settings(state::Settings::default());
+        app.observe_clipboard("scribd.com/doc/1/First");
+        app.text = "My draft that must not be lost".into();
+        app.observe_clipboard("scribd.com/doc/2/Second");
+        assert_eq!(app.text, "My draft that must not be lost");
+        assert!(app.clipboard_suggestion.is_some());
+        app.add_clipboard_suggestion();
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(app.items[0].document_id, "2");
+        assert_eq!(app.text, "My draft that must not be lost");
+        assert!(app.clipboard_suggestion.is_none());
+    }
+    #[test]
+    fn clipboard_detection_can_be_disabled_and_ignores_non_links() {
+        let mut app = App::from_settings(state::Settings::default());
+        app.clipboard_check = false;
+        app.observe_clipboard("scribd.com/doc/1/One");
+        assert!(app.text.is_empty());
+        app.clipboard_check = true;
+        app.observe_clipboard("plain text");
+        assert!(app.text.is_empty());
+        app.observe_clipboard("scribd.com/doc/2/Two");
+        assert!(app.text.contains("/2/"));
+    }
+    #[test]
+    fn same_clipboard_contents_are_not_reinserted_after_adding() {
+        let mut app = App::from_settings(state::Settings::default());
+        let link = "scribd.com/doc/1/First";
+        app.observe_clipboard(link);
+        assert_eq!(app.add_from_input(), 1);
+        app.observe_clipboard(link);
+        assert!(app.text.is_empty());
+        assert_eq!(app.items.len(), 1);
     }
 
 }
