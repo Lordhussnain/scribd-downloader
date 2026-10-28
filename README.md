@@ -41,6 +41,17 @@ security updates. Review the bundled browser and driver licence terms before
 redistribution. The app prefers the bundled pair even if `CHROMEDRIVER` is set;
 a missing file in an existing `runtime` folder is reported as an error.
 
+### Download a GitHub Actions build
+
+The **Windows portable build** workflow runs on pushes, pull requests, and
+manual dispatch. It runs the Rust tests and builds a portable Windows x64
+package with the latest stable matching Chrome for Testing and ChromeDriver
+available when the workflow runs. In GitHub, open **Actions → Windows portable
+build**, choose a successful run, and download the
+`ScribdDownloader-Windows-x64` artifact. Extract it and keep `runtime` next to
+`scribd-rust-gui.exe`. Artifacts expire after 14 days; the workflow does not
+create a GitHub Release or automatically update existing installations.
+
 ### Build an installer
 
 Install Inno Setup 6 on the build PC and run:
@@ -67,8 +78,8 @@ next download, enable **Settings → Show ChromeDriver console (diagnostics)**.
 This is independent of **Show Chrome window while downloading**.
 
 When clipboard detection is enabled, returning to the app with a new Scribd
-link copied will prefill it. If you have edited the input, the app preserves
-your text and offers **Add copied link** instead. While a document is running,
+link copied appends it to the input, preserving any existing text and links.
+Links already in the input are skipped by document ID. While a document is running,
 the progress card shows the current activity, completed pages, elapsed time,
 and an estimated remaining time when enough page information is available.
 During connection and initial loading, a spinner indicates that the total is

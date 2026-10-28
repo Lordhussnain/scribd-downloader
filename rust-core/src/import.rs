@@ -6,6 +6,22 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_LINK_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Append newly copied Scribd links to existing input without modifying the
+/// user's text. Documents already present are deduplicated by document ID.
+/// Links found inside clipboard prose are written as canonical source URLs.
+pub fn append_clipboard_links(existing: &str, clipboard: &str) -> (String, usize) {
+    let mut seen: HashSet<String> = extract_scribd_urls(existing).into_iter().map(|doc| doc.document_id).collect();
+    let mut output = existing.to_owned();
+    let mut added = 0;
+    for doc in extract_scribd_urls(clipboard) {
+        if !seen.insert(doc.document_id) { continue; }
+        if !output.is_empty() && !output.ends_with('\n') { output.push('\n'); }
+        output.push_str(&doc.source_url);
+        added += 1;
+    }
+    (output, added)
+}
+
 /// Split a tkdnd fallback file list, respecting nested brace-quoted paths.
 pub fn split_drop_files(data: &str) -> Vec<String> {
     let mut parts = Vec::new();
@@ -126,4 +142,25 @@ mod tests {
         let dropped = parse_drop_data(&format!("{{{}}}", a.display()));
         assert_eq!(dropped.iter().map(|d| d.document_id.as_str()).collect::<Vec<_>>(), ["1", "2"]);
     }
+    #[test]
+    fn copied_links_append_and_deduplicate_without_overwriting_input() {
+        let (first, count) = append_clipboard_links("My notes", "read https://de.scribd.com/doc/1/First");
+        assert_eq!(count, 1);
+        assert_eq!(first, "My notes\nhttps://www.scribd.com/document/1/First");
+        let (second, count) = append_clipboard_links(&first, "scribd.com/embeds/1/content scribd.com/doc/2/Second");
+        assert_eq!(count, 1);
+        assert_eq!(second, format!("{first}\nhttps://www.scribd.com/document/2/Second"));
+        let (same, count) = append_clipboard_links(&second, "scribd.com/doc/2/Different-Title");
+        assert_eq!(count, 0);
+        assert_eq!(same, second);
+    }
+    #[test]
+    fn clipboard_input_accepts_multiple_links_and_empty_or_non_links() {
+        let (result, count) = append_clipboard_links("", "scribd.com/doc/3/Three scribd.com/doc/4/Four");
+        assert_eq!(count, 2);
+        assert_eq!(extract_scribd_urls(&result).iter().map(|d| d.document_id.as_str()).collect::<Vec<_>>(), ["3", "4"]);
+        assert_eq!(append_clipboard_links(&result, "not a link"), (result, 0));
+        assert_eq!(append_clipboard_links("existing\n", "scribd.com/doc/9/Nine").0, "existing\nhttps://www.scribd.com/document/9/Nine");
+    }
+
 }

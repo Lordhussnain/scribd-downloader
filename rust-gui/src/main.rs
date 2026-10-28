@@ -34,8 +34,6 @@ struct App {
     open_when_done: bool,
     clipboard_check: bool,
     last_clipboard: String,
-    clipboard_prefill: Option<String>,
-    clipboard_suggestion: Option<String>,
     recents: Vec<state::Recent>,
     save_status: String,
     last_saved: Option<state::Settings>,
@@ -64,7 +62,7 @@ impl App {
             Some(item)
         }).collect();
         let policy = match settings.conflict_policy.as_str() { "skip" => ConflictPolicy::Skip, "overwrite" => ConflictPolicy::Overwrite, _ => ConflictPolicy::Copy };
-        Self { text: String::new(), folder: settings.output_dir.clone(), items, active: None, running: false, policy, batch: settings.batch_size, page_timeout: settings.page_load_timeout, export_timeout: settings.export_timeout, show_browser: settings.show_browser, show_driver_console: settings.show_driver_console, settings_open: false, log: String::new(), appearance: settings.appearance.clone(), open_when_done: settings.open_when_done, clipboard_check: settings.clipboard_check, last_clipboard: String::new(), clipboard_prefill: None, clipboard_suggestion: None, recents: settings.recents.clone(), save_status: String::new(), last_saved: Some(settings), current_stage: String::new(), started_at: None, was_focused: false, pages_completed: 0, pages_total: 0, environment_status: Self::environment_status(), input_notice: String::new(), input_error: false }
+        Self { text: String::new(), folder: settings.output_dir.clone(), items, active: None, running: false, policy, batch: settings.batch_size, page_timeout: settings.page_load_timeout, export_timeout: settings.export_timeout, show_browser: settings.show_browser, show_driver_console: settings.show_driver_console, settings_open: false, log: String::new(), appearance: settings.appearance.clone(), open_when_done: settings.open_when_done, clipboard_check: settings.clipboard_check, last_clipboard: String::new(), recents: settings.recents.clone(), save_status: String::new(), last_saved: Some(settings), current_stage: String::new(), started_at: None, was_focused: false, pages_completed: 0, pages_total: 0, environment_status: Self::environment_status(), input_notice: String::new(), input_error: false }
     }
 }
 
@@ -114,39 +112,24 @@ impl App {
             Err(error) => { self.save_status = format!("Could not save settings: {error}"); }
         }
     }
-    /// Only replace text that was automatically prefilled, never a user's edit.
+    /// Append newly copied document links when the window gains focus.
     fn observe_clipboard(&mut self, text: &str) {
         if !self.clipboard_check || text == self.last_clipboard { return; }
         self.last_clipboard = text.to_owned();
-        if extract_scribd_urls(text).is_empty() {
-            self.clipboard_suggestion = None;
-            return;
-        }
-        let may_replace = self.text.trim().is_empty()
-            || self.clipboard_prefill.as_deref() == Some(self.text.as_str());
-        if may_replace {
-            self.text = text.to_owned();
-            self.clipboard_prefill = Some(self.text.clone());
-            self.clipboard_suggestion = None;
-            self.input_notice = "Scribd link detected from clipboard. Review it, then add it to the queue.".into();
-        } else {
-            self.clipboard_suggestion = Some(text.to_owned());
-            self.input_notice = "New Scribd link copied. Add it without replacing your current text.".into();
-        }
+        if extract_scribd_urls(text).is_empty() { return; }
+        let (combined, added) = import::append_clipboard_links(&self.text, text);
+        self.text = combined;
         self.input_error = false;
-    }
-    fn add_clipboard_suggestion(&mut self) {
-        if let Some(text) = self.clipboard_suggestion.take() {
-            let count = self.add(extract_scribd_urls(&text));
-            self.input_error = count == 0;
-            self.input_notice = if count == 0 { "Those documents are already in your queue.".into() } else { format!("Added {count} document{} from clipboard.", if count == 1 { "" } else { "s" }) };
-        }
+        self.input_notice = if added == 0 {
+            "Copied document is already in the input.".into()
+        } else {
+            format!("Detected {added} copied link{}. Add to queue when ready.", if added == 1 { "" } else { "s" })
+        };
     }
     fn read_clipboard(&mut self, add: bool) {
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             Ok(text) => {
                 self.last_clipboard = text.clone();
-                self.clipboard_suggestion = None;
                 let docs = extract_scribd_urls(&text);
                 if !docs.is_empty() {
                     if add {
@@ -213,7 +196,6 @@ impl App {
             "Those documents are already in your queue.".into()
         } else {
             self.text.clear();
-            self.clipboard_prefill = None;
             format!("Added {added} document{} to your queue.", if added == 1 { "" } else { "s" })
         };
         added
@@ -427,12 +409,10 @@ impl eframe::App for App {
                             if ui.add(egui::TextEdit::multiline(&mut self.text).hint_text("https://www.scribd.com/document/...").desired_rows(2).desired_width(f32::INFINITY)).changed() {
                                 self.input_notice.clear();
                                 self.input_error = false;
-                                self.clipboard_prefill = None;
                             }
                             ui.horizontal_wrapped(|ui| {
                                 if ui.add(theme::primary("Add to queue")).clicked() { self.add_from_input(); }
                                 if ui.button("Paste").clicked() { self.read_clipboard(true); }
-                                if self.clipboard_suggestion.is_some() && ui.button("Add copied link").clicked() { self.add_clipboard_suggestion(); }
                                 if ui.button("Add from file…").clicked() {
                                     if let Some(paths) = rfd::FileDialog::new().add_filter("Link files", &["txt", "text", "md", "csv", "url", "html", "htm"]).pick_files() {
                                         let docs = import::read_urls_from_files(&paths);
@@ -672,27 +652,24 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_prefill_updates_when_a_second_link_is_copied() {
+    fn clipboard_appends_each_new_link_without_losing_the_first() {
         let mut app = App::from_settings(state::Settings::default());
         app.observe_clipboard("https://www.scribd.com/document/1/First");
-        assert!(app.text.contains("/1/"));
         app.observe_clipboard("https://www.scribd.com/document/2/Second");
-        assert!(app.text.contains("/2/"));
-        assert!(app.clipboard_suggestion.is_none());
+        let docs = extract_scribd_urls(&app.text);
+        assert_eq!(docs.iter().map(|d| d.document_id.as_str()).collect::<Vec<_>>(), ["1", "2"]);
+        assert!(app.text.contains('\n'));
     }
     #[test]
-    fn clipboard_detection_preserves_user_edits_and_offers_the_new_link() {
+    fn clipboard_appends_to_user_edits_and_skips_duplicate_ids() {
         let mut app = App::from_settings(state::Settings::default());
-        app.observe_clipboard("scribd.com/doc/1/First");
-        app.text = "My draft that must not be lost".into();
-        app.observe_clipboard("scribd.com/doc/2/Second");
-        assert_eq!(app.text, "My draft that must not be lost");
-        assert!(app.clipboard_suggestion.is_some());
-        app.add_clipboard_suggestion();
-        assert_eq!(app.items.len(), 1);
-        assert_eq!(app.items[0].document_id, "2");
-        assert_eq!(app.text, "My draft that must not be lost");
-        assert!(app.clipboard_suggestion.is_none());
+        app.text = "My own notes: scribd.com/doc/1/First".into();
+        app.observe_clipboard("scribd.com/embeds/1/content scribd.com/doc/2/Second");
+        assert!(app.text.starts_with("My own notes: scribd.com/doc/1/First"));
+        let docs = extract_scribd_urls(&app.text);
+        assert_eq!(docs.iter().map(|d| d.document_id.as_str()).collect::<Vec<_>>(), ["1", "2"]);
+        assert_eq!(app.add_from_input(), 2);
+        assert_eq!(app.items.len(), 2);
     }
     #[test]
     fn clipboard_detection_can_be_disabled_and_ignores_non_links() {

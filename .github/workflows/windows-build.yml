@@ -1,0 +1,65 @@
+name: Windows portable build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Test and package Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable MSVC toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust-core -> target
+            rust-browser -> target
+            rust-gui -> target
+
+      - name: Run Rust tests
+        shell: pwsh
+        run: |
+          cargo test --manifest-path rust-core/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --manifest-path rust-browser/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --manifest-path rust-gui/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # build_portable.ps1 fetches Chrome for Testing's latest stable metadata,
+      # downloads both win64 archives from the same release, verifies their
+      # versions, and builds the app with the static MSVC runtime.
+      - name: Build portable package with matching Chrome and ChromeDriver
+        shell: pwsh
+        run: |
+          .\build_windows.bat
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Show packaged browser version
+        shell: pwsh
+        run: Get-Content dist/ScribdDownloader-Portable/PACKAGE-INFO.txt
+
+      - name: Upload portable Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScribdDownloader-Windows-x64
+          path: dist/ScribdDownloader-Portable/
+          if-no-files-found: error
+          # Chrome binaries are already compressed; avoid lengthy recompression.
+          compression-level: 0
+          retention-days: 14
