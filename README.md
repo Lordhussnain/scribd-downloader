@@ -46,18 +46,32 @@ Cancellation is cooperative and may wait for a browser operation to finish or
 time out. Closing the window during a download requests cancellation; wait for
 the current item to finish before closing again.
 
-## Tests
+## Tests on Windows 10
+
+Install Rust stable (MSVC) and the Visual Studio C++ build tools, then open
+PowerShell in the repository root. Run all automated tests with:
+
+```powershell
+.\test_windows.bat
+```
+
+Or run each suite separately:
 
 ```powershell
 cargo test --manifest-path rust-core\Cargo.toml
 cargo test --manifest-path rust-browser\Cargo.toml
-cargo check --manifest-path rust-gui\Cargo.toml
+cargo test --manifest-path rust-gui\Cargo.toml
 ```
 
-The core tests use fake browser operations. The browser crate includes a PDF
-merge test; real end-to-end verification needs Chrome, ChromeDriver, Windows,
-and documents you have permission to access. The GUI and browser backend have
-not yet been validated in that environment.
+Cargo downloads dependencies the first time. The tests use fakes or local
+loopback responses and temporary files; they do not require a live Scribd
+connection or launch Chrome. GUI tests exercise settings and theme logic, not
+actual window interactions. To manually verify the whole app, install Chrome
+and a matching ChromeDriver, then run the app as described above. Test with a
+document you have permission to download: check the PDF's pages and images,
+then try a two-item queue, stop/skip, retry, file conflicts, and reopening the
+app to confirm settings and pending items are restored. The GUI and browser
+backend have not yet been validated on Windows against live documents.
 
 ## Settings and diagnostics
 

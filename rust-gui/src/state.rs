@@ -76,4 +76,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("settings.json"); std::fs::write(&path, "{").unwrap();
         assert_eq!(Settings::load(&path), Settings::default());
     }
+    #[test]
+    fn invalid_values_are_normalized_and_recents_are_bounded() {
+        let mut s = Settings::default();
+        s.appearance = "unexpected".into();
+        s.conflict_policy = "bad".into();
+        s.output_dir.clear();
+        s.batch_size = 99;
+        s.page_load_timeout = 999;
+        s.export_timeout = 1;
+        s.recents = (0..8).map(|i| Recent { path: format!("{i}.pdf"), title: i.to_string() }).collect();
+        s.normalize();
+        assert_eq!(s.appearance, "System");
+        assert_eq!(s.conflict_policy, "copy");
+        assert!(!s.output_dir.is_empty());
+        assert_eq!(s.batch_size, 16);
+        assert_eq!(s.page_load_timeout, 600);
+        assert_eq!(s.export_timeout, 30);
+        assert_eq!(s.recents.len(), 5);
+    }
+    #[test]
+    fn settings_replace_existing_file_without_losing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("settings.json");
+        let mut settings = Settings::default();
+        settings.save(&path).unwrap();
+        settings.appearance = "Dark".into();
+        settings.conflict_policy = "skip".into();
+        settings.open_when_done = true;
+        settings.save(&path).unwrap();
+        let restored = Settings::load(&path);
+        assert_eq!(restored.appearance, "Dark");
+        assert_eq!(restored.conflict_policy, "skip");
+        assert!(restored.open_when_done);
+    }
+    #[test]
+    fn missing_and_partial_settings_are_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert_eq!(Settings::load(&path), Settings::default());
+        std::fs::write(&path, r#"{ "appearance": "Light" }"#).unwrap();
+        let restored = Settings::load(&path);
+        assert_eq!(restored.appearance, "Light");
+        assert_eq!(restored.batch_size, 8);
+        assert!(restored.pending_queue.is_empty());
+    }
+
 }

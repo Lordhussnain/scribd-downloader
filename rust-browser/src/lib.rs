@@ -171,4 +171,86 @@ mod tests {
         assert!(browser.merge(&output).is_err());
         assert_eq!(std::fs::read(&output).unwrap(), before);
     }
+    #[test]
+    fn non_overwrite_policy_preserves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pdf");
+        let output = dir.path().join("output.pdf");
+        page(&source, 123);
+        std::fs::write(&output, b"original").unwrap();
+        let mut browser = Browser::new(false, Duration::from_secs(1), Duration::from_secs(1), false).unwrap();
+        browser.pages.push(source);
+        assert!(browser.merge(&output).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    }
+    #[test]
+    fn empty_merge_does_not_create_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output.pdf");
+        let mut browser = Browser::new(false, Duration::from_secs(1), Duration::from_secs(1), false).unwrap();
+        assert!(browser.merge(&output).is_err());
+        assert!(!output.exists());
+    }
+    #[test]
+    fn invalid_url_never_launches_a_browser() {
+        let mut browser = Browser::new(false, Duration::from_secs(1), Duration::from_secs(1), false).unwrap();
+        assert!(browser.open_and_prepare("https://example.com/not-a-document").is_err());
+        assert!(browser.driver.is_none());
+        assert!(browser.session.is_none());
+    }
+    #[test]
+    fn merge_rejects_invalid_pdf_and_keeps_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("bad.pdf");
+        let output = dir.path().join("output.pdf");
+        std::fs::write(&input, b"not a PDF").unwrap();
+        std::fs::write(&output, b"original").unwrap();
+        let mut browser = Browser::new(false, Duration::from_secs(1), Duration::from_secs(1), true).unwrap();
+        browser.pages.push(input);
+        assert!(browser.merge(&output).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    }
+
+    fn mock_response(status: &str, body: &str) -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let status = status.to_owned();
+        let body = body.to_owned();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 { break; }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (port, handle)
+    }
+    #[test]
+    fn webdriver_protocol_reads_status_response() {
+        let (port, thread) = mock_response("200 OK", r#"{"value":{"ready":true}}"#);
+        let mut browser = Browser::new(false, Duration::from_secs(1), Duration::from_secs(3), false).unwrap();
+        browser.port = port;
+        let response = browser.call("GET", "/status", None).unwrap();
+        assert_eq!(response["ready"], true);
+        assert!(thread.join().unwrap().starts_with("GET /status "));
+    }
+    #[test]
+    fn webdriver_protocol_surfaces_structured_errors() {
+        let (port, thread) = mock_response("404 Not Found", r#"{"value":{"error":"invalid session id","message":"gone"}}"#);
+        let mut browser = Browser::new(false, Duration::from_secs(1), Duration::from_secs(3), false).unwrap();
+        browser.port = port;
+        let message = browser.call("GET", "/missing", None).unwrap_err();
+        assert!(message.contains("invalid session id"));
+        assert!(message.contains("gone"));
+        assert!(thread.join().unwrap().starts_with("GET /missing "));
+    }
+
 }

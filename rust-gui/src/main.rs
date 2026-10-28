@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod state;
+mod theme;
 
 use eframe::egui;
 use scribd_core::{extract_scribd_urls, import, output::{choose_output, ConflictPolicy, OutputDecision}, queue::{QueueItem, QueueStatus}};
@@ -278,97 +279,193 @@ impl eframe::App for App {
         }
         if self.active.is_some() || self.running { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Scribd Downloader");
-                ui.label(concat!("v", env!("CARGO_PKG_VERSION")));
-                if ui.button("Settings").clicked() { self.settings_open = true; }
-            });
-            ui.horizontal(|ui| {
-                ui.label(&self.environment_status);
-                if ui.button("Recheck").clicked() { self.environment_status = Self::environment_status(); }
-                ui.hyperlink_to("Get Chrome", "https://www.google.com/chrome/");
-                ui.hyperlink_to("Get ChromeDriver", "https://developer.chrome.com/docs/chromedriver/downloads");
+            egui::Frame::none().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::symmetric(24.0, 16.0)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    egui::Frame::none().fill(theme::ACCENT).rounding(10.0).inner_margin(egui::Margin::symmetric(14.0, 8.0)).show(ui, |ui| {
+                        ui.label(egui::RichText::new("S").size(22.0).strong().color(egui::Color32::WHITE));
+                    });
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Scribd Downloader").size(21.0).strong());
+                        ui.label(egui::RichText::new(format!("DESKTOP  /  v{}", env!("CARGO_PKG_VERSION"))).size(10.0).color(theme::muted(ui)));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Settings").clicked() { self.settings_open = true; }
+                    });
+                });
             });
         });
         if self.settings_open {
-            egui::Window::new("Settings").open(&mut self.settings_open).show(ctx, |ui| {
-                ui.label("Changes are saved automatically and apply to the next document.");
-                ui.label(&self.save_status);
-                ui.horizontal(|ui| { ui.label("Appearance:"); for name in ["System", "Light", "Dark"] { if ui.selectable_label(self.appearance == name, name).clicked() { self.appearance = name.into(); if name == "Light" { ctx.set_visuals(egui::Visuals::light()); } else if name == "Dark" { ctx.set_visuals(egui::Visuals::dark()); } else if let Some(theme) = frame.info().system_theme { ctx.set_visuals(match theme { eframe::Theme::Dark => egui::Visuals::dark(), eframe::Theme::Light => egui::Visuals::light() }); } } } });
-                ui.horizontal(|ui| { ui.label("Pages loaded at once:"); for n in [4, 8, 16] { ui.selectable_value(&mut self.batch, n, n.to_string()); } });
+            egui::Window::new("Settings").open(&mut self.settings_open).default_width(430.0).show(ctx, |ui| {
+                ui.label(egui::RichText::new("Make it yours").size(18.0).strong());
+                ui.label(egui::RichText::new("Changes save automatically and apply to the next document.").color(theme::muted(ui)).size(12.0));
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Appearance").strong());
+                ui.horizontal(|ui| { for name in ["System", "Light", "Dark"] {
+                    if ui.selectable_label(self.appearance == name, name).clicked() {
+                        self.appearance = name.into();
+                        let dark = match name { "Light" => false, "Dark" => true, _ => frame.info().system_theme.map(|t| t == eframe::Theme::Dark).unwrap_or(true) };
+                        theme::apply(ctx, dark);
+                    }
+                } });
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Download preferences").strong());
+                ui.horizontal(|ui| { ui.label("Pages loaded at once"); for n in [4, 8, 16] { ui.selectable_value(&mut self.batch, n, n.to_string()); } });
                 ui.add(egui::Slider::new(&mut self.page_timeout, 10..=600).text("Page timeout (seconds)"));
                 ui.add(egui::Slider::new(&mut self.export_timeout, 30..=3600).text("Export timeout (seconds)"));
-                ui.checkbox(&mut self.show_browser, "Show Chrome window");
+                ui.checkbox(&mut self.show_browser, "Show Chrome window while downloading");
                 ui.checkbox(&mut self.open_when_done, "Open PDF when done");
                 ui.checkbox(&mut self.clipboard_check, "Detect Scribd links from clipboard");
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(&self.save_status).color(theme::ACCENT_LIGHT).size(12.0));
             });
         }
         egui::CentralPanel::default().show(ctx, |ui| {
-          egui::ScrollArea::vertical().id_source("main_scroll").show(ui, |ui| {
-            ui.label("Add Scribd links (Ctrl+V to paste)");
-            ui.add(egui::TextEdit::multiline(&mut self.text).desired_rows(3).desired_width(f32::INFINITY));
-            ui.horizontal(|ui| {
-                if ui.button("Add to queue").clicked() { let docs = extract_scribd_urls(&self.text); self.add(docs); self.text.clear(); }
-                if ui.button("Paste").clicked() { self.read_clipboard(true); }
-                if ui.button("Add from file…").clicked() { if let Some(paths) = rfd::FileDialog::new().add_filter("Link files", &["txt", "text", "md", "csv", "url", "html", "htm"]).pick_files() { self.add(import::read_urls_from_files(&paths)); } }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Output folder:"); ui.add_enabled(!self.running && self.active.is_none(), egui::TextEdit::singleline(&mut self.folder).desired_width(300.0));
-                if ui.add_enabled(!self.running && self.active.is_none(), egui::Button::new("Browse…")).clicked() { if let Some(path) = rfd::FileDialog::new().pick_folder() { self.folder = path.to_string_lossy().into_owned(); } }
-            });
-            ui.add_enabled_ui(!self.running && self.active.is_none(), |ui| { ui.horizontal(|ui| { ui.label("Existing files:"); ui.selectable_value(&mut self.policy, ConflictPolicy::Copy, "Save as copy"); ui.selectable_value(&mut self.policy, ConflictPolicy::Skip, "Skip existing"); ui.selectable_value(&mut self.policy, ConflictPolicy::Overwrite, "Overwrite"); }); });
-            ui.separator();
-            ui.heading(scribd_core::queue::queue_title_text(&self.items));
-            let mut remove = None;
-            egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
-                for (index, item) in self.items.iter_mut().enumerate() {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("{} — {:?}", item.title, item.status));
-                            if item.status != QueueStatus::Downloading && self.active.as_ref().map_or(true, |a| a.index != index) && ui.button("Remove").clicked() { remove = Some(index); }
-                            if matches!(item.status, QueueStatus::Failed | QueueStatus::Cancelled) && self.active.as_ref().map_or(true, |a| a.index != index) && ui.button("Retry").clicked() { item.status = QueueStatus::Pending; item.detail.clear(); }
-                            if item.status == QueueStatus::Done && ui.button("Open").clicked() { if let Some(path) = &item.output_path { Self::open_path(path, false); } }
-                            if item.status == QueueStatus::Done && ui.button("Folder").clicked() { if let Some(path) = &item.output_path { Self::open_path(path, true); } }
+            egui::ScrollArea::vertical().id_source("main_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                ui.add_space(12.0);
+                // Keep the content comfortable on wide windows, without forcing a
+                // minimum width on smaller Windows displays.
+                let width = ui.available_width().min(900.0);
+                ui.vertical_centered(|ui| {
+                    ui.set_max_width(width);
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Your documents, ready when you are.").size(24.0).strong());
+                        ui.label(egui::RichText::new("Paste a link, build your queue, and save clean PDFs locally.").size(13.0).color(theme::muted(ui)));
+                        ui.add_space(10.0);
+
+                        theme::card(ui, |ui| {
+                            theme::section(ui, "Add Scribd documents", "Paste one or more links, or import a link file.");
+                            ui.add(egui::TextEdit::multiline(&mut self.text).hint_text("https://www.scribd.com/document/...").desired_rows(2).desired_width(f32::INFINITY));
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.add(theme::primary("Add to queue")).clicked() { let docs = extract_scribd_urls(&self.text); self.add(docs); self.text.clear(); }
+                                if ui.button("Paste").clicked() { self.read_clipboard(true); }
+                                if ui.button("Add from file…").clicked() {
+                                    if let Some(paths) = rfd::FileDialog::new().add_filter("Link files", &["txt", "text", "md", "csv", "url", "html", "htm"]).pick_files() { self.add(import::read_urls_from_files(&paths)); }
+                                }
+                            });
+                            ui.label(egui::RichText::new("Tip: you can also drop link files into the window.").size(11.0).color(theme::muted(ui)));
                         });
-                        if item.status == QueueStatus::Pending {
-                            ui.horizontal(|ui| { ui.label("Filename:"); ui.text_edit_singleline(&mut item.filename); });
-                        } else { ui.label(scribd_core::queue::queue_item_subtext(item)); }
-                        if item.status == QueueStatus::Downloading { ui.add(egui::ProgressBar::new(item.percent as f32 / 100.0).show_percentage()); }
+                        ui.add_space(10.0);
+
+                        theme::card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new("Queue").size(16.0).strong());
+                                ui.label(egui::RichText::new(format!("{} documents", self.items.len())).color(theme::muted(ui)).size(12.0));
+                                if ui.add_enabled(!self.running && self.active.is_none(), egui::Button::new("Clear finished")).clicked() { self.items.retain(|i| matches!(i.status, QueueStatus::Pending | QueueStatus::Downloading)); }
+                                if ui.add_enabled(!self.running && self.active.is_none(), egui::Button::new("Clear all")).clicked() { self.items.clear(); }
+                            });
+                            ui.label(egui::RichText::new(scribd_core::queue::queue_title_text(&self.items)).size(11.0).color(theme::muted(ui)));
+                            ui.add_space(5.0);
+                            let mut remove = None;
+                            if self.items.is_empty() {
+                                egui::Frame::none().fill(ui.visuals().extreme_bg_color).rounding(10.0).inner_margin(18.0).show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(egui::RichText::new("Your queue is empty").strong());
+                                        ui.label(egui::RichText::new("Add a document above to get started.").size(12.0).color(theme::muted(ui)));
+                                    });
+                                });
+                            } else {
+                                egui::ScrollArea::vertical().id_source("queue_scroll").max_height(250.0).show(ui, |ui| {
+                                    for (index, item) in self.items.iter_mut().enumerate() {
+                                        egui::Frame::none().fill(ui.visuals().extreme_bg_color).rounding(9.0).inner_margin(12.0).show(ui, |ui| {
+                                            ui.set_min_width(ui.available_width());
+                                            ui.horizontal_wrapped(|ui| {
+                                                let color = match item.status { QueueStatus::Done => theme::ACCENT_LIGHT, QueueStatus::Failed => ui.visuals().error_fg_color, QueueStatus::Downloading => theme::ACCENT_LIGHT, _ => theme::muted(ui) };
+                                                ui.label(egui::RichText::new("●").color(color));
+                                                ui.label(egui::RichText::new(&item.title).strong());
+                                                ui.label(egui::RichText::new(format!("{:?}", item.status)).size(11.0).color(theme::muted(ui)));
+                                                if item.status != QueueStatus::Downloading && self.active.as_ref().map_or(true, |a| a.index != index) && ui.small_button("Remove").clicked() { remove = Some(index); }
+                                                if matches!(item.status, QueueStatus::Failed | QueueStatus::Cancelled) && self.active.as_ref().map_or(true, |a| a.index != index) && ui.small_button("Retry").clicked() { item.status = QueueStatus::Pending; item.detail.clear(); }
+                                                if item.status == QueueStatus::Done && ui.small_button("Open").clicked() { if let Some(path) = &item.output_path { Self::open_path(path, false); } }
+                                                if item.status == QueueStatus::Done && ui.small_button("Folder").clicked() { if let Some(path) = &item.output_path { Self::open_path(path, true); } }
+                                            });
+                                            if item.status == QueueStatus::Pending {
+                                                ui.horizontal(|ui| { ui.label(egui::RichText::new("Filename").size(12.0).color(theme::muted(ui))); ui.add(egui::TextEdit::singleline(&mut item.filename).desired_width(240.0)); });
+                                            } else { ui.label(egui::RichText::new(scribd_core::queue::queue_item_subtext(item)).size(12.0).color(theme::muted(ui))); }
+                                            if item.status == QueueStatus::Downloading { ui.add(egui::ProgressBar::new(item.percent as f32 / 100.0).fill(theme::ACCENT).show_percentage()); }
+                                        });
+                                        ui.add_space(5.0);
+                                    }
+                                });
+                            }
+                            if let Some(index) = remove { self.items.remove(index); if let Some(active) = &mut self.active { if index < active.index { active.index -= 1; } } }
+                        });
+                        ui.add_space(10.0);
+
+                        theme::card(ui, |ui| {
+                            theme::section(ui, "Save PDFs to", "Choose a folder and what to do when a file already exists.");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_enabled(!self.running && self.active.is_none(), egui::TextEdit::singleline(&mut self.folder).desired_width(420.0));
+                                if ui.add_enabled(!self.running && self.active.is_none(), egui::Button::new("Browse…")).clicked() { if let Some(path) = rfd::FileDialog::new().pick_folder() { self.folder = path.to_string_lossy().into_owned(); } }
+                            });
+                            ui.add_enabled_ui(!self.running && self.active.is_none(), |ui| { ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new("If a file exists:").size(12.0).color(theme::muted(ui)));
+                                ui.selectable_value(&mut self.policy, ConflictPolicy::Copy, "Save as copy");
+                                ui.selectable_value(&mut self.policy, ConflictPolicy::Skip, "Skip existing");
+                                ui.selectable_value(&mut self.policy, ConflictPolicy::Overwrite, "Overwrite");
+                            }); });
+                        });
+                        ui.add_space(12.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.add_enabled(!self.running && self.active.is_none(), theme::primary("Download PDF")).clicked() { self.start_queue(); }
+                            if ui.add_enabled(self.active.is_some(), egui::Button::new("Skip current document")).clicked() { self.cancel(false); }
+                            if ui.add_enabled(self.running || self.active.is_some(), egui::Button::new("Stop queue")).clicked() { self.cancel(true); }
+                        });
+
+                        if let Some(started) = self.started_at {
+                            ui.add_space(10.0);
+                            theme::card(ui, |ui| {
+                                theme::section(ui, "Download progress", "Your documents are processed one at a time.");
+                                ui.horizontal_wrapped(|ui| {
+                                    for (key, title) in [("connect", "1  Connect"), ("load", "2  Load pages"), ("export", "3  Export PDF"), ("merge", "4  Merge")] {
+                                        let color = if self.current_stage == key { theme::ACCENT_LIGHT } else { theme::muted(ui) };
+                                        ui.label(egui::RichText::new(title).strong().color(color));
+                                    }
+                                });
+                                let elapsed = started.elapsed().as_secs();
+                                let eta = if self.pages_completed > 0 && self.pages_total > self.pages_completed {
+                                    let remaining = elapsed.saturating_mul((self.pages_total - self.pages_completed) as u64) / self.pages_completed as u64;
+                                    format!("  ·  estimated {remaining}s remaining")
+                                } else { String::new() };
+                                ui.label(egui::RichText::new(format!("{elapsed}s elapsed{eta}")).size(12.0).color(theme::muted(ui)));
+                            });
+                        }
+
+                        if !self.recents.is_empty() {
+                            ui.add_space(10.0);
+                            theme::card(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| { ui.label(egui::RichText::new("Recent downloads").size(16.0).strong()); if ui.button("Open latest PDF").clicked() { Self::open_path(std::path::Path::new(&self.recents[0].path), false); } });
+                                for recent in &self.recents { ui.horizontal_wrapped(|ui| {
+                                    ui.label(&recent.title);
+                                    if ui.small_button("Open").clicked() { Self::open_path(std::path::Path::new(&recent.path), false); }
+                                    if ui.small_button("Folder").clicked() { Self::open_path(std::path::Path::new(&recent.path), true); }
+                                }); }
+                            });
+                        }
+                        ui.add_space(10.0);
+                        theme::card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new("Activity log").size(16.0).strong());
+                                if ui.button("Copy log").clicked() { ui.output_mut(|o| o.copied_text = self.log.clone()); }
+                                if ui.button("Clear").clicked() { self.log.clear(); }
+                                if ui.button("Diagnostics folder").clicked() { Self::open_path(&state::config_dir(), true); }
+                            });
+                            egui::ScrollArea::vertical().id_source("log_scroll").max_height(140.0).show(ui, |ui| {
+                                ui.add(egui::TextEdit::multiline(&mut self.log).hint_text("Download activity will appear here.").desired_width(f32::INFINITY).desired_rows(3).interactive(false));
+                            });
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(&self.environment_status).size(11.0).color(theme::muted(ui)));
+                            if ui.small_button("Recheck").clicked() { self.environment_status = Self::environment_status(); }
+                            ui.hyperlink_to("Chrome", "https://www.google.com/chrome/");
+                            ui.hyperlink_to("ChromeDriver", "https://developer.chrome.com/docs/chromedriver/downloads");
+                        });
+                        ui.label(egui::RichText::new("Runs locally in Chrome  ·  Only download documents you have the right to access.").size(11.0).color(theme::muted(ui)));
+                        ui.add_space(20.0);
                     });
-                }
+                });
             });
-            if let Some(index) = remove {
-                self.items.remove(index);
-                if let Some(active) = &mut self.active { if index < active.index { active.index -= 1; } }
-            }
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!self.running && self.active.is_none(), egui::Button::new("Start queue")).clicked() {
-                    self.start_queue();
-                }
-                if ui.add_enabled(self.active.is_some(), egui::Button::new("Skip current document")).clicked() { self.cancel(false); }
-                if ui.add_enabled(self.running || self.active.is_some(), egui::Button::new("Stop queue")).clicked() { self.cancel(true); }
-                if ui.add_enabled(!self.running && self.active.is_none(), egui::Button::new("Clear finished")).clicked() { self.items.retain(|i| matches!(i.status, QueueStatus::Pending | QueueStatus::Downloading)); }
-                if ui.add_enabled(!self.running && self.active.is_none(), egui::Button::new("Clear all")).clicked() { self.items.clear(); }
-            });
-            if let Some(started) = self.started_at {
-                let elapsed = started.elapsed().as_secs();
-                let eta = if self.pages_completed > 0 && self.pages_total > self.pages_completed {
-                    let remaining = elapsed.saturating_mul((self.pages_total - self.pages_completed) as u64) / self.pages_completed as u64;
-                    format!(" · estimated {remaining}s remaining")
-                } else { String::new() };
-                ui.horizontal(|ui| { ui.label(format!("Connect → Load pages → Export PDF → Merge  ·  {}  ·  {}s elapsed{}", self.current_stage, elapsed, eta)); });
-            }
-            if !self.recents.is_empty() {
-                ui.separator(); ui.horizontal(|ui| { ui.heading("Recent downloads"); if ui.button("Open latest PDF").clicked() { Self::open_path(std::path::Path::new(&self.recents[0].path), false); } });
-                for recent in &self.recents { ui.horizontal(|ui| {
-                    ui.label(&recent.title);
-                    if ui.button("Open").clicked() { Self::open_path(std::path::Path::new(&recent.path), false); }
-                    if ui.button("Folder").clicked() { Self::open_path(std::path::Path::new(&recent.path), true); }
-                }); }
-            }
-            ui.separator(); ui.horizontal(|ui| { ui.label("Activity log"); if ui.button("Copy log").clicked() { ui.output_mut(|o| o.copied_text = self.log.clone()); } if ui.button("Clear log").clicked() { self.log.clear(); } if ui.button("Diagnostics folder").clicked() { Self::open_path(&state::config_dir(), true); } });
-            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| { ui.add(egui::TextEdit::multiline(&mut self.log).desired_width(f32::INFINITY).interactive(false)); });
-          });
         });
         self.save_if_changed();
     }
@@ -378,8 +475,31 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_drag_and_drop(true).with_inner_size([900.0, 800.0]), ..Default::default() };
     eframe::run_native("Scribd Downloader", options, Box::new(|cc| {
         let app = App::default();
-        if app.appearance == "Light" { cc.egui_ctx.set_visuals(egui::Visuals::light()); }
-        if app.appearance == "Dark" { cc.egui_ctx.set_visuals(egui::Visuals::dark()); }
+        let dark = match app.appearance.as_str() { "Light" => false, "Dark" => true, _ => cc.egui_ctx.style().visuals.dark_mode };
+        theme::apply(&cc.egui_ctx, dark);
         Box::new(app)
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn friendly_errors_distinguish_cancel_timeout_and_invalid_page() {
+        assert!(App::friendly_error(&DownloadError::Cancelled).contains("cancelled"));
+        assert!(App::friendly_error(&DownloadError::Timeout("image loading".into())).contains("image loading"));
+        assert!(App::friendly_error(&DownloadError::InvalidPage { page: 3, sheets: 2 }).contains("Page 3"));
+    }
+    #[test]
+    fn clipboard_queue_deduplication_keeps_first_pending_document() {
+        let mut app = App::default();
+        // Tests should not depend on user settings or a saved queue.
+        app.items.clear();
+        let docs = extract_scribd_urls("scribd.com/doc/5/One scribd.com/doc/6/Two");
+        app.add(docs.clone());
+        app.add(docs);
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(app.items[0].document_id, "5");
+        assert_eq!(app.items[1].document_id, "6");
+    }
 }
