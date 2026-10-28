@@ -1,38 +1,59 @@
 # Scribd Downloader — Rust preview
 
-A Windows-focused desktop app that renders accessible Scribd documents in
-Chrome and exports them to PDF. The app and download engine are written in
-Rust; Chrome and ChromeDriver are separate runtime requirements.
+A Windows-focused Rust desktop app that renders accessible Scribd documents
+in Chrome and exports them to PDF.
 
-**Status:** This is an experimental rewrite, not yet verified on Windows or
-against live Scribd documents. The GUI and browser backend have not been built
-in the development environment. Several features of the earlier app are not yet implemented. Check exported
-PDFs before relying on them.
+**Status:** This is an experimental rewrite. The portable build and installer
+have not yet been verified on a clean Windows 10 machine or against live
+Scribd documents. Check exported PDFs before relying on them.
 
-## Requirements
+## Build a portable package on Windows
 
-- Windows 10 or 11, 64-bit.
-- Rust stable with the MSVC toolchain and Visual Studio C++ build tools.
-- Google Chrome.
-- A ChromeDriver compatible with the installed Chrome version. Put
-  `chromedriver.exe` on `PATH`, or set `CHROMEDRIVER` to its full path.
-  ChromeDriver is not downloaded automatically.
-- Internet access for Cargo dependencies and for viewing the document.
-
-## Build and run
-
-From PowerShell in the repository root:
+On the **build PC**, install Rust stable with the x86-64 MSVC toolchain and
+Visual Studio C++ build tools. The first build needs internet access to download
+Rust dependencies and a matching stable Chrome for Testing / ChromeDriver pair.
+From PowerShell in the repository root, run:
 
 ```powershell
-cargo run --release --manifest-path rust-gui\Cargo.toml
+.\build_windows.bat
 ```
 
-The resulting executable is `rust-gui\target\release\scribd-rust-gui.exe`.
-Chrome and ChromeDriver must also be available on the computer where it runs.
-For a debug build, omit `--release`. You can also run `build_windows.bat`.
-To build an installer, install Inno Setup 6 and run `build_installer.bat`;
-its output is written to `dist\installer`. Chrome and ChromeDriver are not
-included in the installer.
+The package is created at:
+
+```text
+dist\ScribdDownloader-Portable\
+  scribd-rust-gui.exe
+  runtime\chrome-win64\          # Chrome for Testing, including its files
+  runtime\chromedriver-win64\    # matching ChromeDriver
+  PACKAGE-INFO.txt
+```
+
+Copy **the entire folder**, not just the `.exe`, to a 64-bit Windows 10 or 11
+PC, and run `scribd-rust-gui.exe`. The target PC does not need Rust, Python,
+Google Chrome, or ChromeDriver installed. Internet is still needed to access
+Scribd documents. The Rust app is built with the static MSVC runtime; standard
+Windows system components and a compatible graphics driver are still required.
+This packaging has not yet been tested on a clean Windows installation.
+
+The bundled Chrome for Testing is fixed at the version selected when you build;
+it does **not** auto-update. Rebuild and redistribute regularly for browser
+security updates. Review the bundled browser and driver licence terms before
+redistribution. The app prefers the bundled pair even if `CHROMEDRIVER` is set;
+a missing file in an existing `runtime` folder is reported as an error.
+
+### Build an installer
+
+Install Inno Setup 6 on the build PC and run:
+
+```powershell
+.\build_installer.bat
+```
+
+The installer in `dist\installer` includes the same app and matching browser
+runtime. It is not yet verified on Windows. To build just the executable for
+development, use `cargo run --release --manifest-path rust-gui\Cargo.toml`;
+that unbundled executable requires a locally installed Chrome and compatible
+ChromeDriver on PATH or configured with `CHROMEDRIVER`.
 
 ## Using the preview
 
@@ -77,8 +98,8 @@ cargo test --manifest-path rust-gui\Cargo.toml
 Cargo downloads dependencies the first time. The tests use fakes or local
 loopback responses and temporary files; they do not require a live Scribd
 connection or launch Chrome. GUI tests exercise settings and theme logic, not
-actual window interactions. To manually verify the whole app, install Chrome
-and a matching ChromeDriver, then run the app as described above. Test with a
+actual window interactions. To manually verify the whole app, build the portable package and run it as
+described above. Test with a
 document you have permission to download: check the PDF's pages and images,
 then try a two-item queue, stop/skip, retry, file conflicts, and reopening the
 app to confirm settings and pending items are restored. The GUI and browser
@@ -97,7 +118,8 @@ These additions have not yet been verified on Windows.
 - The GUI is not yet feature-complete compared with the earlier desktop app;
   browser-link drag-and-drop and exact feature parity remain. The ETA is an estimate.
 - The GUI and browser backend have not been compiled or tested on Windows.
-- ChromeDriver must be installed separately and match Chrome.
+- The bundled browser does not update itself; rebuild to receive security updates.
+- An unbundled development build requires a compatible ChromeDriver and Chrome.
 - Private, removed, restricted, or protected documents may fail. Scribd can
   change its embed page structure, which may require updates.
 - Very large documents may require substantial temporary disk space.

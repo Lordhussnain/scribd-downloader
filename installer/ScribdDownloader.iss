@@ -1,4 +1,4 @@
-; Rust desktop installer. Chrome and ChromeDriver are installed separately.
+; Rust desktop installer with the matching Chrome for Testing runtime.
 #define MyAppName "Scribd Downloader"
 #define MyAppVersion "0.1.0"
 #define MyAppExeName "scribd-rust-gui.exe"
@@ -27,7 +27,7 @@ MinVersion=10.0
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-Source: "..\rust-gui\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\ScribdDownloader-Portable\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

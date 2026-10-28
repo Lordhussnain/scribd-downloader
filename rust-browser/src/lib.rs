@@ -1,4 +1,5 @@
-//! ChromeDriver-backed Rust downloader. Requires a compatible chromedriver on PATH.
+//! ChromeDriver-backed Rust downloader, supporting a bundled browser runtime.
+pub mod runtime;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use lopdf::{dictionary, Document, Object, ObjectId};
 use scribd_core::{download::DownloadBackend, engine::{BatchStatus, PageCountTracker, PageStatus}, parse_scribd_url, scripts};
@@ -68,7 +69,11 @@ impl Browser {
 impl DownloadBackend for Browser {
     fn open_and_prepare(&mut self, url: &str) -> Result<usize, String> {
         let embed = parse_scribd_url(url).ok_or("Invalid Scribd document URL")?.embed_url;
-        let executable = std::env::var_os("CHROMEDRIVER").unwrap_or_else(|| "chromedriver".into());
+        let bundled = runtime::bundled_runtime()?;
+        let executable = match &bundled {
+            Some(pair) => pair.driver.clone().into_os_string(),
+            None => std::env::var_os("CHROMEDRIVER").unwrap_or_else(|| "chromedriver".into()),
+        };
         let driver = self.driver_command(executable).spawn().map_err(|e| format!("Could not start ChromeDriver: {e}. Install a compatible chromedriver and add it to PATH."))?;
         self.driver = Some(driver);
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -79,7 +84,11 @@ impl DownloadBackend for Browser {
         }
         let mut arguments = vec!["--disable-gpu".to_owned(), "--disable-dev-shm-usage".to_owned(), "--hide-scrollbars".to_owned(), "--force-color-profile=srgb".to_owned(), format!("--user-data-dir={}", self.temp.path().join("chrome-profile").display())];
         if !self.show_browser { arguments.push("--headless=new".into()); }
-        let session = self.call("POST", "/session", Some(json!({"capabilities":{"alwaysMatch":{"browserName":"chrome","goog:chromeOptions":{"args":arguments}}}})))?;
+        let mut chrome_options = json!({"args": arguments});
+        if let Some(pair) = bundled {
+            chrome_options["binary"] = json!(pair.chrome.to_string_lossy());
+        }
+        let session = self.call("POST", "/session", Some(json!({"capabilities":{"alwaysMatch":{"browserName":"chrome","goog:chromeOptions":chrome_options}}})))?;
         self.session = Some(session["sessionId"].as_str().ok_or("ChromeDriver returned no session ID")?.to_owned());
         self.call("POST", &self.endpoint("/timeouts")?, Some(json!({"pageLoad":self.page_timeout.as_millis().min(u64::MAX as u128) as u64,"script":self.page_timeout.as_millis().min(u64::MAX as u128) as u64})))?;
         self.call("POST", &self.endpoint("/url")?, Some(json!({"url":embed})))?;

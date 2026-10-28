@@ -73,6 +73,11 @@ impl App {
         std::env::var_os("PATH").map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())).unwrap_or(false)
     }
     fn environment_status() -> String {
+        match scribd_browser::runtime::bundled_runtime() {
+            Ok(Some(_)) => return "Bundled Chrome and ChromeDriver ready".into(),
+            Err(message) => return message,
+            Ok(None) => {}
+        }
         let driver = std::env::var_os("CHROMEDRIVER").map(|path| {
             let path = PathBuf::from(path);
             path.is_file() || path.file_name().and_then(|name| name.to_str()).map(Self::executable_on_path).unwrap_or(false)
