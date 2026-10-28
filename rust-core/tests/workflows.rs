@@ -108,3 +108,48 @@ fn queue_items_start_pending() {
     let doc = parse_scribd_url("scribd.com/doc/5/Test").unwrap();
     assert_eq!(QueueItem::from(&doc).status, QueueStatus::Pending);
 }
+
+#[test]
+fn invalid_options_cleanup_backend_without_opening() {
+    for invalid in [
+        DownloadOptions { batch_size: 0, ..options() },
+        DownloadOptions { page_load_timeout: Duration::ZERO, ..options() },
+        DownloadOptions { poll_interval: Duration::ZERO, ..options() },
+    ] {
+        let mut fake = FakeBackend::default();
+        let result = download(&mut fake, "url", Path::new("out"), &invalid, &AtomicBool::new(false), &mut |_| {});
+        assert!(matches!(result, Err(DownloadError::InvalidOptions(_))));
+        assert_eq!(fake.actions, ["cleanup"]);
+    }
+}
+
+#[test]
+fn cancellation_just_before_merge_leaves_output_untouched() {
+    let cancel = AtomicBool::new(false);
+    let mut fake = FakeBackend { page_sheets: 1, ..Default::default() };
+    let result = download(&mut fake, "url", Path::new("out"), &options(), &cancel, &mut |p| {
+        if p.stage == "export" && p.current == p.total { cancel.store(true, Ordering::Relaxed); }
+    });
+    assert_eq!(result, Err(DownloadError::Cancelled));
+    assert!(!fake.actions.contains(&"merge".to_owned()));
+    assert_eq!(fake.actions.last().unwrap(), "cleanup");
+}
+
+#[test]
+fn unsupported_page_loader_fails_cleanly() {
+    struct Unsupported { cleanup_called: bool }
+    impl DownloadBackend for Unsupported {
+        fn open_and_prepare(&mut self, _: &str) -> Result<usize, String> { Ok(1) }
+        fn probe_batch(&mut self, _: &[usize]) -> Result<BatchStatus, String> {
+            Ok(BatchStatus { supported: false, total: 1, ready: 0, total_images: 0, pending_images: 0, pages: vec![] })
+        }
+        fn print_page(&mut self, _: usize) -> Result<usize, String> { panic!("must not print") }
+        fn release_batch(&mut self, _: &[usize]) -> Result<(), String> { panic!("must not release") }
+        fn merge(&mut self, _: &Path) -> Result<PathBuf, String> { panic!("must not merge") }
+        fn cleanup(&mut self) { self.cleanup_called = true; }
+    }
+    let mut fake = Unsupported { cleanup_called: false };
+    let result = download(&mut fake, "url", Path::new("out"), &options(), &AtomicBool::new(false), &mut |_| {});
+    assert_eq!(result, Err(DownloadError::Backend("Scribd direct page loader is unavailable.".into())));
+    assert!(fake.cleanup_called);
+}

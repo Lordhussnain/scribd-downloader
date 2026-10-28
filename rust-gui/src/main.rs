@@ -42,11 +42,18 @@ struct App {
     pages_completed: usize,
     pages_total: usize,
     environment_status: String,
+    input_notice: String,
+    input_error: bool,
 }
 
 impl Default for App {
     fn default() -> Self {
-        let settings = state::Settings::load(&state::config_dir().join("settings-rust.json"));
+        Self::from_settings(state::Settings::load(&state::config_dir().join("settings-rust.json")))
+    }
+}
+
+impl App {
+    fn from_settings(settings: state::Settings) -> Self {
         let items = settings.pending_queue.iter().filter_map(|entry| {
             let info = scribd_core::parse_scribd_url(&entry.source_url)?;
             let mut item = QueueItem::from(&info);
@@ -54,7 +61,7 @@ impl Default for App {
             Some(item)
         }).collect();
         let policy = match settings.conflict_policy.as_str() { "skip" => ConflictPolicy::Skip, "overwrite" => ConflictPolicy::Overwrite, _ => ConflictPolicy::Copy };
-        Self { text: String::new(), folder: settings.output_dir.clone(), items, active: None, running: false, policy, batch: settings.batch_size, page_timeout: settings.page_load_timeout, export_timeout: settings.export_timeout, show_browser: settings.show_browser, settings_open: false, log: String::new(), appearance: settings.appearance.clone(), open_when_done: settings.open_when_done, clipboard_check: settings.clipboard_check, last_clipboard: String::new(), recents: settings.recents.clone(), save_status: String::new(), last_saved: Some(settings), current_stage: String::new(), started_at: None, was_focused: false, pages_completed: 0, pages_total: 0, environment_status: Self::environment_status() }
+        Self { text: String::new(), folder: settings.output_dir.clone(), items, active: None, running: false, policy, batch: settings.batch_size, page_timeout: settings.page_load_timeout, export_timeout: settings.export_timeout, show_browser: settings.show_browser, settings_open: false, log: String::new(), appearance: settings.appearance.clone(), open_when_done: settings.open_when_done, clipboard_check: settings.clipboard_check, last_clipboard: String::new(), recents: settings.recents.clone(), save_status: String::new(), last_saved: Some(settings), current_stage: String::new(), started_at: None, was_focused: false, pages_completed: 0, pages_total: 0, environment_status: Self::environment_status(), input_notice: String::new(), input_error: false }
     }
 }
 
@@ -104,10 +111,15 @@ impl App {
             Ok(text) => {
                 self.last_clipboard = text.clone();
                 let docs = extract_scribd_urls(&text);
-                if !docs.is_empty() { if add { self.add(docs); } else { self.text = text; } }
-                else if add { self.log.push_str("Clipboard does not contain a Scribd link.\n"); }
+                if !docs.is_empty() {
+                    if add {
+                        let added = self.add(docs);
+                        self.input_error = added == 0;
+                        self.input_notice = if added == 0 { "Those documents are already in your queue.".into() } else { format!("Added {added} document{} from clipboard.", if added == 1 { "" } else { "s" }) };
+                    } else { self.text = text; }
+                } else if add { self.input_error = true; self.input_notice = "Clipboard does not contain a Scribd link.".into(); }
             }
-            Err(e) => if add { self.log.push_str(&format!("Could not read clipboard: {e}\n")); },
+            Err(e) => if add { self.input_error = true; self.input_notice = format!("Could not read clipboard: {e}"); },
         }
     }
     fn open_path(path: &std::path::Path, reveal: bool) {
@@ -144,9 +156,29 @@ impl App {
             }
         }
     }
-    fn add(&mut self, documents: Vec<scribd_core::ScribdDocument>) {
+    fn add(&mut self, documents: Vec<scribd_core::ScribdDocument>) -> usize {
         let mut known: std::collections::HashSet<String> = self.items.iter().filter(|i| matches!(i.status, QueueStatus::Pending | QueueStatus::Downloading)).map(|i| i.document_id.clone()).collect();
-        for doc in documents { if known.insert(doc.document_id.clone()) { self.items.push(QueueItem::from(&doc)); } }
+        let mut added = 0;
+        for doc in documents { if known.insert(doc.document_id.clone()) { self.items.push(QueueItem::from(&doc)); added += 1; } }
+        added
+    }
+
+    fn add_from_input(&mut self) -> usize {
+        let documents = extract_scribd_urls(&self.text);
+        if documents.is_empty() {
+            self.input_notice = "No Scribd document links found. Check the link and try again.".into();
+            self.input_error = true;
+            return 0;
+        }
+        let added = self.add(documents);
+        self.input_error = added == 0;
+        self.input_notice = if added == 0 {
+            "Those documents are already in your queue.".into()
+        } else {
+            self.text.clear();
+            format!("Added {added} document{} to your queue.", if added == 1 { "" } else { "s" })
+        };
+        added
     }
 
     fn start_next(&mut self) {
@@ -187,15 +219,21 @@ impl App {
 
     fn start_queue(&mut self) {
         if self.running || self.active.is_some() { return; }
-        let docs = extract_scribd_urls(&self.text);
-        if !docs.is_empty() { self.add(docs); self.text.clear(); }
+        if !self.text.trim().is_empty() {
+            let _ = self.add_from_input();
+        }
+        if self.folder.trim().is_empty() {
+            self.input_error = true;
+            self.input_notice = "Choose an output folder before starting the queue.".into();
+            return;
+        }
         for item in &mut self.items {
             if item.status == QueueStatus::Pending {
                 item.filename = format!("{}.pdf", scribd_core::sanitize_filename(&item.filename, "scribd-document"));
             }
         }
         if self.items.iter().any(|i| i.status == QueueStatus::Pending) { self.running = true; }
-        else { self.log.push_str("Add a Scribd document before starting the queue.\n"); }
+        else if self.input_notice.is_empty() { self.input_error = true; self.input_notice = "Add a Scribd document before starting the queue.".into(); }
     }
     fn cancel(&mut self, stop: bool) {
         if stop { self.running = false; }
@@ -260,8 +298,16 @@ impl eframe::App for App {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped.is_empty() {
             let paths: Vec<PathBuf> = dropped.iter().filter_map(|f| f.path.clone()).collect();
-            self.add(import::read_urls_from_files(&paths));
-            for file in dropped { if let Some(bytes) = file.bytes { if let Ok(text) = std::str::from_utf8(&bytes) { self.add(extract_scribd_urls(text)); } } }
+            let mut added = self.add(import::read_urls_from_files(&paths));
+            for file in dropped {
+                if let Some(bytes) = file.bytes {
+                    if bytes.len() <= import::MAX_LINK_FILE_BYTES as usize {
+                        if let Ok(text) = std::str::from_utf8(&bytes) { added += self.add(extract_scribd_urls(text)); }
+                    }
+                }
+            }
+            self.input_error = added == 0;
+            self.input_notice = if added == 0 { "No new Scribd links found in the dropped files.".into() } else { format!("Added {added} document{} from dropped files.", if added == 1 { "" } else { "s" }) };
         }
         let focused = ctx.input(|i| i.focused);
         if focused && !self.was_focused && self.clipboard_check && self.text.is_empty() {
@@ -330,19 +376,33 @@ impl eframe::App for App {
                     ui.vertical(|ui| {
                         ui.label(egui::RichText::new("Your documents, ready when you are.").size(24.0).strong());
                         ui.label(egui::RichText::new("Paste a link, build your queue, and save clean PDFs locally.").size(13.0).color(theme::muted(ui)));
+                        ui.label(egui::RichText::new(&self.environment_status).size(11.0).color(theme::muted(ui)));
                         ui.add_space(10.0);
 
                         theme::card(ui, |ui| {
                             theme::section(ui, "Add Scribd documents", "Paste one or more links, or import a link file.");
-                            ui.add(egui::TextEdit::multiline(&mut self.text).hint_text("https://www.scribd.com/document/...").desired_rows(2).desired_width(f32::INFINITY));
+                            if ui.add(egui::TextEdit::multiline(&mut self.text).hint_text("https://www.scribd.com/document/...").desired_rows(2).desired_width(f32::INFINITY)).changed() {
+                                self.input_notice.clear();
+                                self.input_error = false;
+                            }
                             ui.horizontal_wrapped(|ui| {
-                                if ui.add(theme::primary("Add to queue")).clicked() { let docs = extract_scribd_urls(&self.text); self.add(docs); self.text.clear(); }
+                                if ui.add(theme::primary("Add to queue")).clicked() { self.add_from_input(); }
                                 if ui.button("Paste").clicked() { self.read_clipboard(true); }
                                 if ui.button("Add from file…").clicked() {
-                                    if let Some(paths) = rfd::FileDialog::new().add_filter("Link files", &["txt", "text", "md", "csv", "url", "html", "htm"]).pick_files() { self.add(import::read_urls_from_files(&paths)); }
+                                    if let Some(paths) = rfd::FileDialog::new().add_filter("Link files", &["txt", "text", "md", "csv", "url", "html", "htm"]).pick_files() {
+                                        let docs = import::read_urls_from_files(&paths);
+                                        let added = self.add(docs);
+                                        self.input_error = added == 0;
+                                        self.input_notice = if added == 0 { "No new Scribd links found in those files.".into() } else { format!("Added {added} document{} from file.", if added == 1 { "" } else { "s" }) };
+                                    }
                                 }
                             });
-                            ui.label(egui::RichText::new("Tip: you can also drop link files into the window.").size(11.0).color(theme::muted(ui)));
+                            if self.input_notice.is_empty() {
+                                ui.label(egui::RichText::new("Tip: you can also drop link files into the window.").size(11.0).color(theme::muted(ui)));
+                            } else {
+                                let color = if self.input_error { ui.visuals().error_fg_color } else { theme::ACCENT_LIGHT };
+                                ui.label(egui::RichText::new(&self.input_notice).size(12.0).color(color));
+                            }
                         });
                         ui.add_space(10.0);
 
@@ -492,9 +552,7 @@ mod tests {
     }
     #[test]
     fn clipboard_queue_deduplication_keeps_first_pending_document() {
-        let mut app = App::default();
-        // Tests should not depend on user settings or a saved queue.
-        app.items.clear();
+        let mut app = App::from_settings(state::Settings::default());
         let docs = extract_scribd_urls("scribd.com/doc/5/One scribd.com/doc/6/Two");
         app.add(docs.clone());
         app.add(docs);
@@ -502,4 +560,53 @@ mod tests {
         assert_eq!(app.items[0].document_id, "5");
         assert_eq!(app.items[1].document_id, "6");
     }
+    #[test]
+    fn invalid_input_is_preserved_with_actionable_feedback() {
+        let mut app = App::from_settings(state::Settings::default());
+        app.text = "https://example.org/not-scribd".into();
+        assert_eq!(app.add_from_input(), 0);
+        assert_eq!(app.text, "https://example.org/not-scribd");
+        assert!(app.input_error);
+        assert!(app.input_notice.contains("No Scribd"));
+        assert!(app.items.is_empty());
+    }
+    #[test]
+    fn valid_and_duplicate_input_update_queue_and_feedback() {
+        let mut app = App::from_settings(state::Settings::default());
+        app.text = "scribd.com/document/7/One scribd.com/doc/8/Two".into();
+        assert_eq!(app.add_from_input(), 2);
+        assert!(!app.input_error);
+        assert!(app.text.is_empty());
+        assert_eq!(app.items.len(), 2);
+        app.text = "scribd.com/doc/7/One".into();
+        assert_eq!(app.add_from_input(), 0);
+        assert!(app.input_error);
+        assert_eq!(app.items.len(), 2);
+        assert!(!app.text.is_empty());
+    }
+    #[test]
+    fn start_rejects_empty_output_folder_without_losing_queue() {
+        let mut app = App::from_settings(state::Settings::default());
+        app.folder = " ".into();
+        app.text = "scribd.com/document/1/Example".into();
+        app.start_queue();
+        assert!(!app.running);
+        assert_eq!(app.items.len(), 1);
+        assert!(app.input_notice.contains("output folder"));
+    }
+    #[test]
+    fn snapshot_saves_pending_and_active_but_not_finished_items() {
+        let mut app = App::from_settings(state::Settings::default());
+        app.add(extract_scribd_urls("scribd.com/doc/1/A scribd.com/doc/2/B scribd.com/doc/3/C"));
+        app.items[1].status = QueueStatus::Downloading;
+        app.items[2].status = QueueStatus::Done;
+        let saved = app.snapshot();
+        assert_eq!(saved.pending_queue.len(), 2);
+        assert!(saved.pending_queue[0].source_url.contains("/1/"));
+        assert!(saved.pending_queue[1].source_url.contains("/2/"));
+        let restored = App::from_settings(saved);
+        assert_eq!(restored.items.len(), 2);
+        assert!(restored.items.iter().all(|item| item.status == QueueStatus::Pending));
+    }
+
 }

@@ -40,9 +40,13 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), DownloadError> {
 /// Run one document in bounded, sequential page batches.
 /// Chrome calls themselves can block: the backend must apply command timeouts.
 pub fn download<B: DownloadBackend>(backend: &mut B, url: &str, output: &Path, options: &DownloadOptions, cancel: &AtomicBool, progress: &mut dyn FnMut(Progress)) -> Result<PathBuf, DownloadError> {
-    if options.batch_size == 0 { return Err(DownloadError::InvalidOptions("batch size must be at least 1")); }
-    if options.page_load_timeout.is_zero() || options.poll_interval.is_zero() { return Err(DownloadError::InvalidOptions("timeouts and poll interval must be positive")); }
-    let result = download_inner(backend, url, output, options, cancel, progress);
+    let result = if options.batch_size == 0 {
+        Err(DownloadError::InvalidOptions("batch size must be at least 1"))
+    } else if options.page_load_timeout.is_zero() || options.poll_interval.is_zero() {
+        Err(DownloadError::InvalidOptions("timeouts and poll interval must be positive"))
+    } else {
+        download_inner(backend, url, output, options, cancel, progress)
+    };
     backend.cleanup();
     result
 }
