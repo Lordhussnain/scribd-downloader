@@ -17,13 +17,13 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     visuals.faint_bg_color = field;
     visuals.override_text_color = Some(text);
     visuals.window_rounding = Rounding::same(14.0);
-    visuals.window_stroke = Stroke::new(1.0, border);
+    visuals.window_stroke = Stroke::new(1.0_f32, border);
     visuals.hyperlink_color = if dark { ACCENT_LIGHT } else { ACCENT };
     visuals.selection.bg_fill = if dark { ACCENT_LIGHT } else { ACCENT };
-    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
     for widget in [&mut visuals.widgets.inactive, &mut visuals.widgets.hovered, &mut visuals.widgets.active, &mut visuals.widgets.open] {
         widget.rounding = Rounding::same(8.0);
-        widget.bg_stroke = Stroke::new(1.0, border);
+        widget.bg_stroke = Stroke::new(1.0_f32, border);
     }
     visuals.widgets.inactive.bg_fill = field;
     visuals.widgets.hovered.bg_fill = if dark { Color32::from_rgb(42, 48, 52) } else { Color32::from_rgb(234, 241, 240) };
@@ -44,7 +44,7 @@ pub fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     let dark = ui.visuals().dark_mode;
     Frame::none()
         .fill(if dark { Color32::from_rgb(28, 31, 36) } else { Color32::WHITE })
-        .stroke(Stroke::new(1.0, if dark { Color32::from_rgb(39, 44, 51) } else { Color32::from_rgb(227, 230, 234) }))
+        .stroke(Stroke::new(1.0_f32, if dark { Color32::from_rgb(39, 44, 51) } else { Color32::from_rgb(227, 230, 234) }))
         .rounding(Rounding::same(14.0))
         .inner_margin(Margin::same(18.0))
         .show(ui, |ui| { ui.set_min_width(ui.available_width()); add(ui); });
