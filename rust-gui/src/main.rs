@@ -71,12 +71,13 @@ impl App {
         std::env::var_os("PATH").map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())).unwrap_or(false)
     }
     fn environment_status() -> String {
-        match scribd_browser::runtime::bundled_runtime() {
-            Ok(Some(_)) => return "Bundled Chrome and ChromeDriver ready".into(),
+        let bundled_driver_only = match scribd_browser::runtime::bundled_runtime() {
+            Ok(Some(pair)) if pair.chrome.is_some() => return "Bundled Chrome and ChromeDriver ready".into(),
+            Ok(Some(_)) => true,
             Err(message) => return message,
-            Ok(None) => {}
-        }
-        let driver = std::env::var_os("CHROMEDRIVER").map(|path| {
+            Ok(None) => false,
+        };
+        let driver = bundled_driver_only || std::env::var_os("CHROMEDRIVER").map(|path| {
             let path = PathBuf::from(path);
             path.is_file() || path.file_name().and_then(|name| name.to_str()).map(Self::executable_on_path).unwrap_or(false)
         }).unwrap_or_else(|| Self::executable_on_path(if cfg!(windows) { "chromedriver.exe" } else { "chromedriver" }));
@@ -88,6 +89,7 @@ impl App {
             Self::executable_on_path("google-chrome") || Self::executable_on_path("chromium") || Self::executable_on_path("chromium-browser")
         };
         match (chrome, driver) {
+            (true, true) if bundled_driver_only => "Chrome detected; bundled ChromeDriver (versions not checked)".into(),
             (true, true) => "Chrome and ChromeDriver detected (versions not checked)".into(),
             (false, true) => "Chrome not detected; install Chrome or check its location".into(),
             (true, false) => "ChromeDriver not found; add a compatible driver to PATH".into(),

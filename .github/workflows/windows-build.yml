@@ -66,8 +66,9 @@ jobs:
           name: ScribdDownloader-Windows-x64
           path: dist/ScribdDownloader-Portable/
           if-no-files-found: error
-          # Chrome binaries are already compressed; avoid lengthy recompression.
-          compression-level: 0
+          # The portable folder contains uncompressed browser binaries and
+          # resources. Compress them to reduce the downloaded artifact size.
+          compression-level: 6
           retention-days: 14
 
       # Only scheduled/manual builds and default-branch pushes publish. PRs and
@@ -79,7 +80,7 @@ jobs:
           (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
         shell: pwsh
         run: |
-          Compress-Archive -LiteralPath dist/ScribdDownloader-Portable -DestinationPath dist/ScribdDownloader-Windows-x64.zip -CompressionLevel Fastest
+          Compress-Archive -LiteralPath dist/ScribdDownloader-Portable -DestinationPath dist/ScribdDownloader-Windows-x64.zip -CompressionLevel Optimal
           if (-not (Test-Path -LiteralPath dist/ScribdDownloader-Windows-x64.zip -PathType Leaf)) { throw 'Release archive was not created.' }
 
       - name: Publish GitHub pre-release

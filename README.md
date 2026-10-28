@@ -48,7 +48,10 @@ pull requests. Successful scheduled and manually dispatched builds, plus pushes
 to the default branch, also publish a ZIP as an **experimental pre-release**
 under GitHub **Releases**. Each release includes a matched stable Chrome for
 Testing and ChromeDriver, selected when the build runs. Extract the ZIP and
-keep the `runtime` folder next to `scribd-rust-gui.exe`.
+keep the `runtime` folder next to `scribd-rust-gui.exe`. The download includes
+Chrome and is compressed to reduce its size; the extracted folder will be
+larger. For a smaller package, use the unbundled development build, which
+requires a separately installed Chrome and compatible ChromeDriver.
 
 The schedule runs every Sunday at 02:00 UTC (07:00 Pakistan time). GitHub runs
 scheduled workflows from the repository's **default branch**, so the schedule
@@ -57,6 +60,38 @@ GitHub may delay scheduled runs and can disable schedules in inactive public
 repositories. Feature-branch pushes and pull requests produce workflow artifacts
 only; those artifacts expire after 14 days. Experimental pre-releases do not
 replace a stable release or automatically update installed copies.
+
+### Smaller Windows packages
+
+There are two additional weekly Windows release workflows:
+
+| Package | Included | Required on the target PC | Weekly schedule |
+| --- | --- | --- | --- |
+| Driver-only | App and latest stable ChromeDriver | Google Chrome compatible with the bundled driver | Sunday 02:15 UTC (07:15 Pakistan) |
+| System | App only | Chrome and a compatible ChromeDriver on `PATH`, or `CHROMEDRIVER` set to the driver's full path | Sunday 02:30 UTC (07:30 Pakistan) |
+
+Neither package needs Rust or Python on the target PC. Both use the static MSVC
+runtime for the Rust executable and still need standard Windows system components.
+The driver-only package uses the installed Chrome; its latest-stable bundled
+driver can become incompatible if the installed Chrome is a different version.
+Neither the bundled driver nor the app updates itself. Rebuild or download a
+new release when necessary. Copy the entire extracted folder so the driver-only
+package retains its `runtime` directory.
+
+Scheduled and manually dispatched builds, and default-branch pushes, publish
+separate experimental pre-releases. Other branch pushes and pull requests only
+upload artifacts. As with the full package, weekly schedules start only after
+these workflow files are merged into the default branch. Run locally on a
+Windows build PC with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_portable.ps1 -Mode DriverOnly
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_portable.ps1 -Mode System
+```
+
+The output folders are `dist\ScribdDownloader-DriverOnly` and
+`dist\ScribdDownloader-System`. These new variants and their workflows have
+not yet been verified on Windows.
 
 ### Build an installer
 
@@ -135,8 +170,9 @@ These additions have not yet been verified on Windows.
 - The GUI is not yet feature-complete compared with the earlier desktop app;
   browser-link drag-and-drop and exact feature parity remain. The ETA is an estimate.
 - The GUI and browser backend have not been compiled or tested on Windows.
-- The bundled browser does not update itself; rebuild to receive security updates.
-- An unbundled development build requires a compatible ChromeDriver and Chrome.
+- The bundled browser and driver do not update themselves; rebuild to receive security updates.
+- Driver-only and system packages require a compatible installed Chrome; the
+  system package also requires ChromeDriver separately.
 - Private, removed, restricted, or protected documents may fail. Scribd can
   change its embed page structure, which may require updates.
 - Very large documents may require substantial temporary disk space.

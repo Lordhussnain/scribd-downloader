@@ -85,8 +85,8 @@ impl DownloadBackend for Browser {
         let mut arguments = vec!["--disable-gpu".to_owned(), "--disable-dev-shm-usage".to_owned(), "--hide-scrollbars".to_owned(), "--force-color-profile=srgb".to_owned(), format!("--user-data-dir={}", self.temp.path().join("chrome-profile").display())];
         if !self.show_browser { arguments.push("--headless=new".into()); }
         let mut chrome_options = json!({"args": arguments});
-        if let Some(pair) = bundled {
-            chrome_options["binary"] = json!(pair.chrome.to_string_lossy());
+        if let Some(chrome) = bundled.and_then(|pair| pair.chrome) {
+            chrome_options["binary"] = json!(chrome.to_string_lossy());
         }
         let session = self.call("POST", "/session", Some(json!({"capabilities":{"alwaysMatch":{"browserName":"chrome","goog:chromeOptions":chrome_options}}})))?;
         self.session = Some(session["sessionId"].as_str().ok_or("ChromeDriver returned no session ID")?.to_owned());
