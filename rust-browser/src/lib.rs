@@ -2,14 +2,14 @@
 pub mod runtime;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use lopdf::{dictionary, Document, Object, ObjectId};
-use scribd_core::{download::DownloadBackend, engine::{BatchStatus, PageCountTracker, PageStatus}, parse_scribd_url, scripts};
+use scribd_core::{download::{DownloadBackend, DownloadError}, engine::{BatchStatus, PageCountTracker, PageStatus}, parse_scribd_url, scripts};
 use serde_json::{json, Value};
-use std::{net::TcpListener, path::{Path, PathBuf}, process::{Child, Command, Stdio}, thread, time::{Duration, Instant}};
+use std::{net::TcpListener, path::{Path, PathBuf}, process::{Child, Command, Stdio}, sync::atomic::{AtomicBool, Ordering}, thread, time::{Duration, Instant}};
 
 pub struct Browser {
     driver: Option<Child>, session: Option<String>, port: u16, agent: ureq::Agent,
     temp: tempfile::TempDir, pages: Vec<PathBuf>,
-    show_browser: bool, page_timeout: Duration, overwrite: bool, show_driver_console: bool,
+    show_browser: bool, page_timeout: Duration, overwrite: bool, show_driver_console: bool, visual_selection: bool,
 }
 
 impl Browser {
@@ -19,12 +19,19 @@ impl Browser {
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         drop(listener);
         let agent = ureq::AgentBuilder::new().timeout(command_timeout).build();
-        Ok(Self { driver: None, session: None, port, agent, temp, pages: Vec::new(), show_browser, page_timeout, overwrite, show_driver_console: false })
+        Ok(Self { driver: None, session: None, port, agent, temp, pages: Vec::new(), show_browser, page_timeout, overwrite, show_driver_console: false, visual_selection: false })
     }
     /// Show the ChromeDriver console for troubleshooting. By default Windows
     /// starts it without a console window. This does not control Chrome itself.
     pub fn with_driver_console(mut self, show: bool) -> Self {
         self.show_driver_console = show;
+        self
+    }
+
+    /// Selecting pages uses the actual document in a visible Chrome window.
+    pub fn with_visual_selection(mut self, enabled: bool) -> Self {
+        self.visual_selection = enabled;
+        if enabled { self.show_browser = true; }
         self
     }
 
@@ -108,6 +115,39 @@ impl DownloadBackend for Browser {
         self.execute(scripts::PRINT_STYLES, json!([]))?;
         Ok(count)
     }
+    fn requires_page_selection(&self) -> bool { self.visual_selection }
+    fn select_pages(&mut self, total: usize, cancel: &AtomicBool) -> Result<Option<Vec<usize>>, DownloadError> {
+        if !self.visual_selection { return Ok(None); }
+        let started = self.execute(include_str!("select_pages.js"), json!([total])).map_err(DownloadError::Backend)?;
+        if let Some(error) = started["error"].as_str() { return Err(DownloadError::Backend(error.into())); }
+        if started["ok"].as_bool() != Some(true) { return Err(DownloadError::Backend("Could not start page selection in Chrome.".into())); }
+        let result = loop {
+            if cancel.load(Ordering::Relaxed) { break Err(DownloadError::Cancelled); }
+            let state = match self.execute("const s = window.__scribdPageSelection; return s ? {status:s.status,pages:s.pages,visible:Array.from(s.visible)} : null;", json!([])) {
+                Ok(value) => value,
+                Err(error) => break Err(DownloadError::Backend(format!("Chrome preview closed or failed: {error}"))),
+            };
+            match state["status"].as_str() {
+                Some("pending") => {
+                    // Reuse the bounded loader to make visible preview pages
+                    // inspectable even when Scribd lazily loads their content.
+                    if let Some(visible) = state["visible"].as_array() {
+                        let pages: Vec<usize> = visible.iter().filter_map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok())).filter(|&n| n > 0 && n <= total).take(16).collect();
+                        if !pages.is_empty() { let _ = self.probe_batch(&pages); }
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                }
+                Some("cancelled") => break Err(DownloadError::Cancelled),
+                Some("done") => {
+                    let pages = state["pages"].as_array().ok_or_else(|| DownloadError::Backend("Invalid page selection returned by Chrome.".into()));
+                    break pages.and_then(|values| values.iter().map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| DownloadError::Backend("Invalid page number returned by Chrome.".into()))).collect::<Result<Vec<_>, _>>()).map(Some);
+                }
+                _ => break Err(DownloadError::Backend("Page selection was lost; keep the Chrome preview open.".into())),
+            }
+        };
+        let _ = self.execute("const s = window.__scribdPageSelection; if (s) { s.cleanup(); delete window.__scribdPageSelection; } return true;", json!([]));
+        result
+    }
     fn probe_batch(&mut self, pages: &[usize]) -> Result<BatchStatus, String> {
         let value = self.execute(scripts::PROBE_BATCH, json!([pages]))?;
         Ok(BatchStatus { supported: value["supported"].as_bool().unwrap_or(false), total: value["total"].as_u64().unwrap_or(pages.len() as u64) as usize, ready: value["ready"].as_u64().unwrap_or(0) as usize, total_images: value["totalImages"].as_u64().unwrap_or(0) as usize, pending_images: value["pendingImages"].as_u64().unwrap_or(0) as usize, pages: value["pages"].as_array().map(|a| a.iter().map(|p| PageStatus { number: p["pageNum"].as_u64().unwrap_or(0) as usize, ready: p["ready"].as_bool().unwrap_or(false), reason: p["reason"].as_str().unwrap_or("").into() }).collect()).unwrap_or_default() })
@@ -176,6 +216,24 @@ impl DownloadBackend for Browser {
 }
 impl Drop for Browser { fn drop(&mut self) { self.cleanup(); } }
 
+/// Save a new PDF with one 1-based page removed. Never modifies the source or
+/// replaces an existing destination, including if another process races us.
+pub fn save_without_page(source: &Path, output: &Path, page: u32) -> Result<PathBuf, String> {
+    let mut doc = Document::load(source).map_err(|e| format!("Could not open PDF: {e}"))?;
+    let count = doc.get_pages().len();
+    if count < 2 { return Err("A PDF must have at least two pages to remove one.".into()); }
+    if page == 0 || page as usize > count { return Err(format!("Choose a page from 1 to {count}.")); }
+    doc.delete_pages(&[page]);
+    if doc.get_pages().len() != count - 1 { return Err("Could not safely remove that page.".into()); }
+    let parent = output.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| format!("Could not create output: {e}"))?;
+    doc.save_to(temp.as_file_mut()).map_err(|e| format!("Could not save PDF: {e}"))?;
+    let verified = Document::load(temp.path()).map_err(|e| format!("Could not verify PDF: {e}"))?;
+    if verified.get_pages().len() != count - 1 { return Err("The saved PDF did not contain the expected pages.".into()); }
+    temp.persist_noclobber(output).map_err(|e| format!("Could not save without replacing an existing file: {e}"))?;
+    Ok(output.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +245,31 @@ mod tests {
         let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
         doc.trailer.set("Root", catalog);
         doc.save(path).unwrap();
+    }
+    #[test]
+    fn remove_page_saves_separate_copy_and_preserves_original_and_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("1.pdf"); let second = dir.path().join("2.pdf"); let third = dir.path().join("3.pdf");
+        let source = dir.path().join("source.pdf"); let output = dir.path().join("copy.pdf");
+        page(&first, 100); page(&second, 200); page(&third, 300);
+        let mut browser = Browser::new(false, Duration::from_secs(1), Duration::from_secs(1), true).unwrap();
+        browser.pages = vec![first, second, third]; browser.merge(&source).unwrap();
+        let before = std::fs::read(&source).unwrap();
+        assert!(save_without_page(&source, &output, 0).is_err());
+        assert!(save_without_page(&source, &output, 4).is_err());
+        assert!(!output.exists());
+        save_without_page(&source, &output, 2).unwrap();
+        let result = Document::load(&output).unwrap();
+        let widths: Vec<i64> = result.get_pages().values().map(|id| result.get_dictionary(*id).unwrap().get(b"MediaBox").unwrap().as_array().unwrap()[2].as_i64().unwrap()).collect();
+        assert_eq!(widths, [100, 300]);
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        let copy_before = std::fs::read(&output).unwrap();
+        assert!(save_without_page(&source, &output, 1).is_err());
+        assert!(save_without_page(&source, &source, 1).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), copy_before);
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        let single = dir.path().join("single.pdf"); page(&single, 100);
+        assert!(save_without_page(&single, &dir.path().join("empty.pdf"), 1).is_err());
     }
     #[test]
     fn merge_produces_ordered_pages_and_preserves_existing_on_error() {

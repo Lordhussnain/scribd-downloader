@@ -11,6 +11,7 @@ A Windows desktop app built in Rust for exporting accessible Scribd documents to
 - **Document queue:** Add multiple links, edit filenames, retry items, skip a document, or stop the queue.
 - **Flexible input:** Paste links, import a link file, or drop supported link files into the window. Clipboard detection can append newly copied links when you return to the app, without duplicating document IDs already in the input.
 - **Download progress:** See the current activity, completed pages, elapsed time, and an estimated time remaining when available.
+- **Page tools:** Optionally choose pages visually in Chrome before exporting, and remove a page from a completed download by saving a separate PDF copy.
 - **Save controls:** Choose an output folder and save a copy, skip, or overwrite when a file already exists.
 - **Desktop preferences:** Light, dark, and system appearance; page loading and timeout settings; optional browser and ChromeDriver diagnostic windows; and an option to open the PDF when finished.
 - **Local state:** Settings, recent downloads, pending queue items, and diagnostics are kept on your computer.
@@ -45,6 +46,22 @@ The driver-only build uses the installed Chrome; it does not automatically match
 4. Follow progress in the download card. Use **Skip current document** or **Stop queue** if needed.
 
 To append copied links automatically, enable **Settings → Detect Scribd links from clipboard**. When you return focus to the app, new links are appended to the existing input; links for document IDs already present are skipped. The **Paste** button is also available.
+
+### Select or remove pages
+
+To download only certain pages:
+
+1. Before starting the queue, enable **Visually select pages in Chrome before downloading**. A Chrome preview opens for each queued document, with all pages selected initially.
+2. Scroll through the document and click pages to toggle them. Blue outlines indicate selected pages; orange dashed outlines indicate excluded pages. Pages may take time to load as you scroll.
+3. Select **Download selected** in the Chrome toolbar. You can also use **Select all**, **Clear selection**, or **Cancel**. At least one page must be selected. The PDF contains selected pages in their original document order.
+
+To remove one page from a completed download:
+
+1. Select **Remove PDF page…** on the completed queue item.
+2. Enter the page number as it appears in the saved PDF, starting at 1. If the PDF contains selected pages only, use its new page numbers rather than the original document's numbers.
+3. Choose a new filename to save the edited copy. The app never modifies the original or overwrites an existing file. A PDF must have at least two pages.
+
+These page tools are experimental and have not yet been verified against live Scribd documents. Closing the Chrome preview or cancelling stops the current download.
 
 Cancellation is cooperative: a stop or skip can wait for the current browser operation to finish or time out. If you close the window during a download, cancellation is requested; wait for the current item to finish before closing again.
 

@@ -26,6 +26,10 @@ pub enum DownloadError { Cancelled, InvalidOptions(&'static str), Backend(String
 /// is called once even if another backend method returns an error.
 pub trait DownloadBackend {
     fn open_and_prepare(&mut self, url: &str) -> Result<usize, String>;
+    /// Return None for every page, or the 1-based pages chosen by the user.
+    /// Called after opening the document and before any page is printed.
+    fn requires_page_selection(&self) -> bool { false }
+    fn select_pages(&mut self, _total: usize, _cancel: &AtomicBool) -> Result<Option<Vec<usize>>, DownloadError> { Ok(None) }
     fn probe_batch(&mut self, pages: &[usize]) -> Result<BatchStatus, String>;
     fn print_page(&mut self, page: usize) -> Result<usize, String>;
     fn release_batch(&mut self, pages: &[usize]) -> Result<(), String>;
@@ -56,11 +60,28 @@ fn download_inner<B: DownloadBackend>(backend: &mut B, url: &str, output: &Path,
     progress(Progress { stage: "connect", current: 0, total: 0, message: "Starting Chrome…".into() });
     let total = backend.open_and_prepare(url).map_err(DownloadError::Backend)?;
     if total == 0 { return Err(DownloadError::Backend("No printable document pages found.".into())); }
-    let mut first = 1;
-    while first <= total {
+    check_cancel(cancel)?;
+    if backend.requires_page_selection() {
+        progress(Progress { stage: "select", current: 0, total: 0, message: "Select pages in the Chrome preview, then choose Download selected.".into() });
+    }
+    let selected = match backend.select_pages(total, cancel)? {
+        None => (1..=total).collect::<Vec<_>>(),
+        Some(mut pages) => {
+            if pages.is_empty() || pages.iter().any(|&page| page == 0 || page > total) {
+                return Err(DownloadError::InvalidOptions("Select at least one valid page."));
+            }
+            pages.sort_unstable();
+            pages.dedup();
+            pages
+        }
+    };
+    check_cancel(cancel)?;
+    let selected_total = selected.len();
+    let mut completed = 0;
+    for pages in selected.chunks(options.batch_size) {
         check_cancel(cancel)?;
-        let last = first + (total - first).min(options.batch_size - 1);
-        let pages: Vec<usize> = (first..=last).collect();
+        let first = pages[0];
+        let last = pages[pages.len() - 1];
         let started = Instant::now();
         let mut tracker = BatchTracker::new(options.page_load_timeout);
         loop {
@@ -69,9 +90,9 @@ fn download_inner<B: DownloadBackend>(backend: &mut B, url: &str, output: &Path,
                 BatchDecision::TimedOut(details) => return Err(DownloadError::Timeout(details)),
                 _ => {}
             }
-            let decision = match backend.probe_batch(&pages) {
+            let decision = match backend.probe_batch(pages) {
                 Ok(status) => {
-                    progress(Progress { stage: "load", current: first - 1, total, message: format!("Loading pages {first}-{last}: {}/{} ready", status.ready, status.total) });
+                    progress(Progress { stage: "load", current: completed, total: selected_total, message: format!("Loading selected pages {first}-{last}: {}/{} ready", status.ready, status.total) });
                     tracker.observe(status)
                 }
                 Err(error) => tracker.browser_error(&error),
@@ -85,21 +106,20 @@ fn download_inner<B: DownloadBackend>(backend: &mut B, url: &str, output: &Path,
             let remaining = options.page_load_timeout.saturating_sub(started.elapsed());
             thread::sleep(options.poll_interval.min(remaining));
         }
-        for &page in &pages {
+        for &page in pages {
             check_cancel(cancel)?;
-            progress(Progress { stage: "export", current: page - 1, total, message: format!("Printing page {page} of {total}…") });
+            progress(Progress { stage: "export", current: completed, total: selected_total, message: format!("Printing document page {page} ({}/{selected_total})…", completed + 1) });
             let sheets = backend.print_page(page).map_err(DownloadError::Backend)?;
             if sheets != 1 { return Err(DownloadError::InvalidPage { page, sheets }); }
-            progress(Progress { stage: "export", current: page, total, message: format!("Page {page} of {total}") });
+            completed += 1;
+            progress(Progress { stage: "export", current: completed, total: selected_total, message: format!("Exported document page {page} ({completed}/{selected_total})") });
         }
-        backend.release_batch(&pages).map_err(DownloadError::Backend)?;
-        if last == total { break; }
-        first = last + 1;
+        backend.release_batch(pages).map_err(DownloadError::Backend)?;
     }
     check_cancel(cancel)?;
-    progress(Progress { stage: "merge", current: total, total, message: format!("Merging {total} pages into one PDF…") });
+    progress(Progress { stage: "merge", current: selected_total, total: selected_total, message: format!("Merging {selected_total} pages into one PDF…") });
     let result = backend.merge(output).map_err(DownloadError::Backend)?;
-    progress(Progress { stage: "done", current: total, total, message: "PDF saved successfully.".into() });
+    progress(Progress { stage: "done", current: selected_total, total: selected_total, message: "PDF saved successfully.".into() });
     Ok(result)
 }
 

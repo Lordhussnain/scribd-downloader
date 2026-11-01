@@ -51,9 +51,11 @@ struct FakeBackend {
     fail_release: bool,
     fail_merge: bool,
     page_sheets: usize,
+    selection: Option<Vec<usize>>,
 }
 impl DownloadBackend for FakeBackend {
     fn open_and_prepare(&mut self, _: &str) -> Result<usize, String> { self.actions.push("open".into()); Ok(3) }
+    fn select_pages(&mut self, _: usize, _: &AtomicBool) -> Result<Option<Vec<usize>>, DownloadError> { Ok(self.selection.clone()) }
     fn probe_batch(&mut self, pages: &[usize]) -> Result<BatchStatus, String> {
         self.actions.push(format!("probe {pages:?}"));
         Ok(BatchStatus { supported: true, total: pages.len(), ready: pages.len(), total_images: 0, pending_images: 0, pages: vec![] })
@@ -152,4 +154,23 @@ fn unsupported_page_loader_fails_cleanly() {
     let result = download(&mut fake, "url", Path::new("out"), &options(), &AtomicBool::new(false), &mut |_| {});
     assert_eq!(result, Err(DownloadError::Backend("Scribd direct page loader is unavailable.".into())));
     assert!(fake.cleanup_called);
+}
+
+#[test]
+fn selected_pages_are_deduplicated_sorted_and_reported_by_selection_count() {
+    let mut fake = FakeBackend { page_sheets: 1, selection: Some(vec![3, 1, 3]), ..Default::default() };
+    let mut events = vec![];
+    let result = download(&mut fake, "url", Path::new("out"), &options(), &AtomicBool::new(false), &mut |p| events.push(p));
+    assert!(result.is_ok());
+    assert_eq!(fake.actions, ["open", "probe [1, 3]", "page 1", "page 3", "release", "merge", "cleanup"]);
+    assert_eq!((events.last().unwrap().current, events.last().unwrap().total), (2, 2));
+}
+
+#[test]
+fn empty_and_out_of_range_selections_never_print_or_merge() {
+    for selection in [vec![], vec![0], vec![4], vec![1, 5]] {
+        let mut fake = FakeBackend { page_sheets: 1, selection: Some(selection), ..Default::default() };
+        assert!(matches!(download(&mut fake, "url", Path::new("out"), &options(), &AtomicBool::new(false), &mut |_| {}), Err(DownloadError::InvalidOptions(_))));
+        assert_eq!(fake.actions, ["open", "cleanup"]);
+    }
 }

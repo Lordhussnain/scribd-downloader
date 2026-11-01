@@ -16,6 +16,13 @@ struct Active {
     result_received: bool,
 }
 
+struct DeletePageDialog {
+    source: PathBuf,
+    page: u32,
+    status: String,
+    worker: Option<Receiver<Result<PathBuf, String>>>,
+}
+
 struct App {
     text: String,
     folder: String,
@@ -28,6 +35,8 @@ struct App {
     export_timeout: u32,
     show_browser: bool,
     show_driver_console: bool,
+    select_pages: bool,
+    delete_dialog: Option<DeletePageDialog>,
     settings_open: bool,
     log: String,
     appearance: String,
@@ -62,7 +71,7 @@ impl App {
             Some(item)
         }).collect();
         let policy = match settings.conflict_policy.as_str() { "skip" => ConflictPolicy::Skip, "overwrite" => ConflictPolicy::Overwrite, _ => ConflictPolicy::Copy };
-        Self { text: String::new(), folder: settings.output_dir.clone(), items, active: None, running: false, policy, batch: settings.batch_size, page_timeout: settings.page_load_timeout, export_timeout: settings.export_timeout, show_browser: settings.show_browser, show_driver_console: settings.show_driver_console, settings_open: false, log: String::new(), appearance: settings.appearance.clone(), open_when_done: settings.open_when_done, clipboard_check: settings.clipboard_check, last_clipboard: String::new(), recents: settings.recents.clone(), save_status: String::new(), last_saved: Some(settings), current_stage: String::new(), started_at: None, was_focused: false, pages_completed: 0, pages_total: 0, environment_status: Self::environment_status(), input_notice: String::new(), input_error: false }
+        Self { text: String::new(), folder: settings.output_dir.clone(), items, active: None, running: false, policy, batch: settings.batch_size, page_timeout: settings.page_load_timeout, export_timeout: settings.export_timeout, show_browser: settings.show_browser, show_driver_console: settings.show_driver_console, select_pages: false, delete_dialog: None, settings_open: false, log: String::new(), appearance: settings.appearance.clone(), open_when_done: settings.open_when_done, clipboard_check: settings.clipboard_check, last_clipboard: String::new(), recents: settings.recents.clone(), save_status: String::new(), last_saved: Some(settings), current_stage: String::new(), started_at: None, was_focused: false, pages_completed: 0, pages_total: 0, environment_status: Self::environment_status(), input_notice: String::new(), input_error: false }
     }
 }
 
@@ -218,6 +227,7 @@ impl App {
         let output = path.clone();
         let show_browser = self.show_browser;
         let show_driver_console = self.show_driver_console;
+        let select_pages = self.select_pages;
         let overwrite = self.policy == ConflictPolicy::Overwrite;
         let page_timeout = Duration::from_secs(self.page_timeout as u64);
         let command_timeout = Duration::from_secs(self.export_timeout as u64);
@@ -228,7 +238,7 @@ impl App {
         thread::spawn(move || {
             let result = match scribd_browser::Browser::new(show_browser, page_timeout, command_timeout, overwrite) {
                 Ok(browser) => {
-                    let mut browser = browser.with_driver_console(show_driver_console);
+                    let mut browser = browser.with_driver_console(show_driver_console).with_visual_selection(select_pages);
                     download::download(&mut browser, &url, &output, &options, &worker_cancel, &mut |p| { let _ = tx.send(WorkerEvent::Progress(p)); })
                 },
                 Err(error) => Err(DownloadError::Backend(error)),
@@ -349,7 +359,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.log.push_str("Stopping current download. Close the window after it finishes.\n");
         }
-        if self.active.is_some() || self.running { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
+        if self.active.is_some() || self.running || self.delete_dialog.as_ref().is_some_and(|d| d.worker.is_some()) { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             egui::Frame::none().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::symmetric(24.0, 16.0)).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -391,6 +401,43 @@ impl eframe::App for App {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(&self.save_status).color(theme::ACCENT_LIGHT).size(12.0));
             });
+        }
+        if let Some(dialog) = &mut self.delete_dialog {
+            let result = dialog.worker.as_ref().and_then(|worker| match worker.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("PDF editing worker stopped unexpectedly.".into())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            });
+            if let Some(result) = result {
+                dialog.worker = None;
+                dialog.status = match result { Ok(path) => format!("Saved copy: {}", path.display()), Err(error) => error };
+            }
+            let mut close = false;
+            egui::Window::new("Remove a PDF page").collapsible(false).resizable(true).default_width(440.0).show(ctx, |ui| {
+                ui.label(format!("Source: {}", dialog.source.display()));
+                ui.label("Page numbers refer to the saved PDF, starting at 1. The original is never modified.");
+                ui.horizontal(|ui| { ui.label("Page to remove:"); ui.add_enabled(dialog.worker.is_none(), egui::DragValue::new(&mut dialog.page).clamp_range(1..=u32::MAX)); });
+                if dialog.worker.is_some() { ui.spinner(); ui.label("Saving a copy…"); }
+                if !dialog.status.is_empty() { ui.label(&dialog.status); }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(dialog.worker.is_none(), egui::Button::new("Save copy without page…")).clicked() {
+                        let stem = dialog.source.file_stem().and_then(|s| s.to_str()).unwrap_or("document");
+                        let suggested = format!("{stem}-without-page-{}.pdf", dialog.page);
+                        let mut picker = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(&suggested);
+                        if let Some(parent) = dialog.source.parent() { picker = picker.set_directory(parent); }
+                        if let Some(output) = picker.save_file() {
+                            let source = dialog.source.clone();
+                            let page = dialog.page;
+                            let (tx, rx) = mpsc::channel();
+                            dialog.status.clear();
+                            dialog.worker = Some(rx);
+                            thread::spawn(move || { let _ = tx.send(scribd_browser::save_without_page(&source, &output, page)); });
+                        }
+                    }
+                    if ui.add_enabled(dialog.worker.is_none(), egui::Button::new("Close")).clicked() { close = true; }
+                });
+            });
+            if close { self.delete_dialog = None; }
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().id_source("main_scroll").auto_shrink([false, false]).show(ui, |ui| {
@@ -449,7 +496,7 @@ impl eframe::App for App {
                                 });
                                 ui.add_space(6.0);
                                 if self.pages_total == 0 {
-                                    ui.horizontal(|ui| { ui.spinner(); ui.label(egui::RichText::new("Connecting and preparing pages…").size(12.0).color(theme::muted(ui))); });
+                                    ui.horizontal(|ui| { ui.spinner(); ui.label(egui::RichText::new(if self.current_stage == "select" { "Select pages in the Chrome window…" } else { "Connecting and preparing pages…" }).size(12.0).color(theme::muted(ui))); });
                                 } else {
                                     let progress = self.pages_completed as f32 / self.pages_total as f32;
                                     ui.add(egui::ProgressBar::new(progress.clamp(0.0, 1.0)).fill(theme::ACCENT).desired_width(ui.available_width()).show_percentage());
@@ -477,6 +524,7 @@ impl eframe::App for App {
                             ui.label(egui::RichText::new(scribd_core::queue::queue_title_text(&self.items)).size(11.0).color(theme::muted(ui)));
                             ui.add_space(5.0);
                             let mut remove = None;
+                            let mut delete_source = None;
                             if self.items.is_empty() {
                                 egui::Frame::none().fill(ui.visuals().extreme_bg_color).rounding(10.0).inner_margin(18.0).show(ui, |ui| {
                                     ui.set_min_width(ui.available_width());
@@ -499,6 +547,7 @@ impl eframe::App for App {
                                                 if matches!(item.status, QueueStatus::Failed | QueueStatus::Cancelled) && self.active.as_ref().map_or(true, |a| a.index != index) && ui.small_button("Retry").clicked() { item.status = QueueStatus::Pending; item.detail.clear(); }
                                                 if item.status == QueueStatus::Done && ui.small_button("Open").clicked() { if let Some(path) = &item.output_path { Self::open_path(path, false); } }
                                                 if item.status == QueueStatus::Done && ui.small_button("Folder").clicked() { if let Some(path) = &item.output_path { Self::open_path(path, true); } }
+                                                if item.status == QueueStatus::Done && ui.small_button("Remove PDF page…").clicked() { delete_source = item.output_path.clone(); }
                                             });
                                             if item.status == QueueStatus::Pending {
                                                 ui.horizontal(|ui| { ui.label(egui::RichText::new("Filename").size(12.0).color(theme::muted(ui))); ui.add(egui::TextEdit::singleline(&mut item.filename).desired_width((ui.available_width() - 20.0).max(100.0))); });
@@ -510,11 +559,18 @@ impl eframe::App for App {
                                 });
                             }
                             if let Some(index) = remove { self.items.remove(index); if let Some(active) = &mut self.active { if index < active.index { active.index -= 1; } } }
+                            if let Some(source) = delete_source {
+                                if self.delete_dialog.as_ref().map_or(true, |d| d.worker.is_none()) {
+                                    self.delete_dialog = Some(DeletePageDialog { source, page: 1, status: String::new(), worker: None });
+                                }
+                            }
                         });
                         ui.add_space(10.0);
 
                         theme::card(ui, |ui| {
                             theme::section(ui, "Save PDFs to", "Choose a folder and what to do when a file already exists.");
+                            ui.add_enabled(!self.running && self.active.is_none(), egui::Checkbox::new(&mut self.select_pages, "Visually select pages in Chrome before downloading"));
+                            if self.select_pages { ui.label(egui::RichText::new("A Chrome preview opens for each queued document. Click pages to select them, then choose Download selected.").size(11.0).color(theme::muted(ui))); }
                             ui.horizontal_wrapped(|ui| {
                                 ui.add_enabled(!self.running && self.active.is_none(), egui::TextEdit::singleline(&mut self.folder).desired_width((ui.available_width() - 115.0).max(100.0)));
                                 if ui.add_enabled(!self.running && self.active.is_none(), egui::Button::new("Browse…")).clicked() { if let Some(path) = rfd::FileDialog::new().pick_folder() { self.folder = path.to_string_lossy().into_owned(); } }
