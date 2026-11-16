@@ -1,0 +1,17 @@
+name: Windows build - system Chrome and driver
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  # Sundays 02:30 UTC. GitHub schedules run only from the default branch.
+  schedule:
+    - cron: '30 2 * * 0'
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/windows-lightweight-reusable.yml
+    with:
+      mode: System

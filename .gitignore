@@ -48,3 +48,8 @@ Thumbs.db
 .chrome-pdf-check/
 scribd-chrome-profile-*/
 
+
+# Rust build output
+rust-core/target/
+rust-gui/target/
+rust-browser/target/

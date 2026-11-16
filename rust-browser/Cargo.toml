@@ -1,0 +1,13 @@
+[package]
+name = "scribd-browser"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+scribd-core = { path = "../rust-core" }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["json"] }
+base64 = "0.22"
+lopdf = "0.32"
+tempfile = "3"
